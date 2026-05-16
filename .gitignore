@@ -1,0 +1,6 @@
+oemer/checkpoints/
+seg_unet.keras
+output/
+.venv/
+__pycache__/
+*.pyc

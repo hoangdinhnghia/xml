@@ -1,0 +1,11 @@
+{
+  "model": "D:\\oemer\\oemer\\checkpoints/unet_big",
+  "timings": {
+    "model_load_s": 0.5619,
+    "tiling_s": 0.0001,
+    "predict_s": 60.204,
+    "merge_s": 0.1549,
+    "total_s": 61.0416
+  },
+  "model_sha256": "ed496582a5a05eab4f3996675573401b41a30c3df65cfc27dbb448a995ba1151"
+}

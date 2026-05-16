@@ -1,0 +1,13 @@
+onnxruntime-gpu
+opencv-python-headless>=4.5.3.56
+matplotlib
+pillow
+scipy
+scikit-learn>=1.2
+types-Pillow
+types-tensorflow
+typing-extensions
+
+[tf]
+tensorflow
+tf2onnx

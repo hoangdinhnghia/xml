@@ -1,0 +1,11 @@
+{
+  "model": "D:\\oemer\\oemer\\checkpoints/seg_net",
+  "timings": {
+    "model_load_s": 0.2416,
+    "tiling_s": 0.0001,
+    "predict_s": 111.3155,
+    "merge_s": 0.25,
+    "total_s": 111.9355
+  },
+  "model_sha256": "ed2e1a86ea75712ee6cdc740e96f7a36753543cf9bb980227c071c9256d9d82e"
+}

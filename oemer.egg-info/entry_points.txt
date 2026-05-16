@@ -1,0 +1,2 @@
+[console_scripts]
+oemer = oemer.ete:main

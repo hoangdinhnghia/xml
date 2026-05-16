@@ -1,0 +1,42 @@
+<html><head><meta charset="utf-8"><title>OMR Viewer</title>
+<style>body{font-family:Arial;} .canvas{position:relative;display:inline-block;} .box{position:absolute;border:2px solid red;opacity:0.6;} .box.toggled{border-color:lime;opacity:0.9}</style>
+</head><body>
+<h2>OMR Viewer - jingle_bell</h2>
+<div>
+<div class='canvas'><img id='img' src='jingle_bell.jpg' style='max-width:900px;display:block;'><div id='boxes' style='position:absolute;left:0;top:0;'></div></div>
+<div style='margin-top:8px;'><h4>Entropy heatmap</h4><img src='jingle_bell.jpg.entropy.png' style='max-width:900px;display:block;'></div>
+</div>
+<script>
+const boxes = [[971, 112, 1004, 171], [1140, 133, 1155, 152], [998, 150, 1010, 163], [1706, 350, 1710, 418], [1282, 352, 1285, 421], [879, 354, 882, 422], [587, 359, 591, 426], [774, 359, 791, 413], [683, 361, 695, 431], [1018, 360, 1028, 430], [1096, 360, 1118, 421], [1530, 375, 1533, 419], [316, 406, 347, 447], [1710, 601, 1714, 670], [1282, 603, 1286, 670], [314, 604, 331, 629], [879, 604, 882, 673], [311, 607, 342, 661], [1368, 794, 1374, 855], [1307, 805, 1310, 858], [2018, 804, 2024, 873], [813, 806, 817, 876], [1566, 820, 1589, 875], [316, 874, 339, 903], [1309, 1061, 1313, 1132], [811, 1062, 815, 1133], [301, 1064, 342, 1121], [854, 1069, 873, 1142], [2025, 1068, 2029, 1111], [415, 1070, 438, 1100], [512, 1072, 520, 1126], [967, 1077, 989, 1151], [1194, 1077, 1212, 1151], [1081, 1089, 1087, 1151], [414, 1102, 417, 1144]];
+const img = document.getElementById('img');
+const container = document.getElementById('boxes');
+function placeBoxes(){
+  container.innerHTML='';
+  const rect = img.getBoundingClientRect();
+  const iw = img.naturalWidth, ih = img.naturalHeight;
+  const dw = rect.width, dh = rect.height;
+  const scaleX = dw/iw, scaleY = dh/ih;
+  boxes.forEach((b,idx)=>{
+    const [x1,y1,x2,y2]=b;
+    const el = document.createElement('div');
+    el.className='box';
+    el.style.left = (x1*scaleX)+'px';
+    el.style.top = (y1*scaleY)+'px';
+    el.style.width = ((x2-x1)*scaleX)+'px';
+    el.style.height = ((y2-y1)*scaleY)+'px';
+    el.dataset.idx = idx;
+    el.onclick = function(e){ this.classList.toggle('toggled'); };
+    container.appendChild(el);
+  });
+}
+window.addEventListener('load', placeBoxes);
+window.addEventListener('resize', placeBoxes);
+function downloadJSON(){
+  const toggled = Array.from(document.querySelectorAll('.box.toggled')).map(e=>parseInt(e.dataset.idx));
+  const payload = {boxes: boxes, reviewed: toggled};
+  const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(payload, null, 2));
+  const a = document.createElement('a'); a.setAttribute('href', dataStr); a.setAttribute('download', 'jingle_bell.review.json'); document.body.appendChild(a); a.click(); a.remove();
+}
+</script>
+<div style='margin-top:10px;'><button onclick='downloadJSON()'>Download review JSON</button></div>
+</body></html>
