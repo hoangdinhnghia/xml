@@ -15,7 +15,7 @@ from oemer.symbol_extraction import Barline, Clef, Sfn, Rest, SfnType, ClefType,
 from oemer.note_group_extraction import NoteGroup
 from oemer.notehead_extraction import NoteHead, NoteType
 from oemer.utils import get_global_unit_size, get_total_track_nums
-from oemer.logger import get_logger
+from oemer.utils import get_logger
 
 
 logger = get_logger(__name__)
@@ -574,7 +574,14 @@ class MusicXMLBuilder:
         self.gen_measures(group_container)
 
         Action.clear()
-        first_measure = self.measures[0][0]
+        if not self.measures:
+            raise RuntimeError("No measures were generated; cannot build MusicXML")
+        if 0 in self.measures and self.measures[0]:
+            first_group = 0
+        else:
+            first_group = sorted(self.measures.keys())[0]
+            logger.warning("Measure group 0 is missing; using group %s as the first measure group", first_group)
+        first_measure = self.measures[first_group][0]
         self.actions.append(AddInit(first_measure))
 
         cur_key = first_measure.get_key()
@@ -819,9 +826,11 @@ def sort_symbols(voices: List[Voice]) -> Dict[int, List[Any]]:
 
 
 def get_label_by_dura(duration, mapping):
+    duration = int(duration)
     min_diff = 9999999
     tar_label = None
     for label, dura in mapping.items():
+        dura = int(dura)
         diff = duration - dura
         if diff >= 0 and diff < min_diff:
             min_diff = diff
@@ -1002,7 +1011,23 @@ def decode_clef(clef) -> Element:
     elem = Element('attributes')
     cc = SubElement(elem, 'clef', attrib={'number': str(clef.track+1)})
     sign = SubElement(cc, 'sign')
-    sign.text = clef.label.name[0]
+    # Heuristic safeguard: if clef detected as F on upper track but notes on that
+    # track have positions indicating treble range, prefer G to avoid octave drop.
+    try:
+        label_char = clef.label.name[0]
+        if clef.label.name == 'F_CLEF' and clef.track == 0:
+            notes = layers.get_layer('notes')
+            if notes is not None and len(notes) > 0:
+                pos_vals = [n.staff_line_pos for n in notes if getattr(n, 'track', None) == clef.track and n.staff_line_pos is not None]
+                if pos_vals:
+                    import numpy as _np
+                    med = _np.median(_np.array(pos_vals))
+                    if med > 3:  # heuristic threshold: high median -> likely treble
+                        label_char = 'G'
+                        logger.warning('decode_clef heuristic: overriding F -> G for track %s (median pos=%.1f)', clef.track, med)
+    except Exception:
+        label_char = clef.label.name[0]
+    sign.text = label_char
     line = SubElement(cc, 'line')
     line.text = '2' if sign.text == 'G' else '4'
     return elem

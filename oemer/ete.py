@@ -16,7 +16,7 @@ import numpy as np
 from oemer import MODULE_PATH
 from oemer import layers
 from oemer.inference import inference
-from oemer.logger import get_logger
+from oemer.utils import get_logger
 from oemer.dewarp import estimate_coords, dewarp
 from oemer.staffline_extraction import extract as staff_extract
 from oemer.notehead_extraction import extract as note_extract
@@ -36,12 +36,14 @@ def clear_data() -> None:
         layers.delete_layer(l)
 
 
-def generate_pred(img_path: str, use_tf: bool = False) -> Tuple[ndarray, ndarray, ndarray, ndarray, ndarray]:
+def generate_pred(img_path: str, use_tf: bool = False, print_artifacts: bool = False, generate_artifacts: bool = False) -> Tuple[ndarray, ndarray, ndarray, ndarray, ndarray]:
     logger.info("Extracting staffline and symbols")
     staff_symbols_map, _ = inference(
         os.path.join(MODULE_PATH, "checkpoints/unet_big"),
         img_path,
         use_tf=use_tf,
+        print_artifacts=print_artifacts,
+        generate_artifacts=generate_artifacts,
     )
     staff = np.where(staff_symbols_map==1, 1, 0)
     symbols = np.where(staff_symbols_map==2, 1, 0)
@@ -53,6 +55,8 @@ def generate_pred(img_path: str, use_tf: bool = False) -> Tuple[ndarray, ndarray
         img_path,
         manual_th=None,
         use_tf=use_tf,
+        print_artifacts=print_artifacts,
+        generate_artifacts=generate_artifacts,
     )
     stems_rests = np.where(sep==1, 1, 0)
     notehead = np.where(sep==2, 1, 0)
@@ -118,7 +122,12 @@ def extract(args: Namespace) -> str:
         if args.use_tf:
             ori_inf_type = os.environ.get("INFERENCE_WITH_TF", None)
             os.environ["INFERENCE_WITH_TF"] = "true"
-        staff, symbols, stems_rests, notehead, clefs_keys = generate_pred(str(img_path), use_tf=args.use_tf)
+        staff, symbols, stems_rests, notehead, clefs_keys = generate_pred(
+            str(img_path),
+            use_tf=args.use_tf,
+            print_artifacts=getattr(args, 'print_artifacts', False),
+            generate_artifacts=getattr(args, 'generate_artifacts', False),
+        )
         if args.use_tf and ori_inf_type is not None:
             os.environ["INFERENCE_WITH_TF"] = ori_inf_type
         if args.save_cache:
@@ -265,6 +274,18 @@ def get_parser() -> ArgumentParser:
     parser.add_argument(
         "--save-intermediate",
         help="Save intermediate prediction maps and dewarped images.",
+        action='store_true')
+    parser.add_argument(
+        "--print-artifacts",
+        help="Print report and viewer information to terminal instead of writing files.",
+        action='store_true')
+    parser.add_argument(
+        "--generate-artifacts",
+        help="Write post-processing artifact files (entropy, overlays, reports, viewer).",
+        action='store_true')
+    parser.add_argument(
+        "--use-new-extractors",
+        help="Use the new experimental staffline and notehead extractors.",
         action='store_true')
     return parser
 

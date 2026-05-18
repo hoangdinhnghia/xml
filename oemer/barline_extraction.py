@@ -15,10 +15,13 @@ def get_degree(line):
 
 def filter_lines(lines, min_degree=75):
     staffs = layers.get_layer('staffs')
+    staffs = [st for st in np.array(staffs, dtype=object).reshape(-1) if st is not None]
+    if not staffs:
+        return []
 
     lines = filter_out_of_range_bbox(lines)
-    min_y = min([st.y_upper for st in staffs.reshape(-1, 1).squeeze()])
-    max_y = max([st.y_lower for st in staffs.reshape(-1, 1).squeeze()])
+    min_y = min([st.y_upper for st in staffs])
+    max_y = max([st.y_lower for st in staffs])
 
     cands = []
     for line in lines:

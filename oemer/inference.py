@@ -19,7 +19,7 @@ import numpy as np
 from numpy import ndarray
 
 from oemer import MODULE_PATH
-from oemer.logger import get_logger
+from oemer.utils import get_logger
 from oemer.postproc import (
     gaussian_weighted_merge,
     save_cache,
@@ -32,7 +32,6 @@ from oemer.postproc import (
 from oemer.postproc import low_conf_bboxes, create_overlay
 from oemer import note_group_extraction as nge
 from oemer.utils import get_unit_size
-from oemer import config as oemer_config
 
 logger = get_logger(__name__)
 
@@ -163,6 +162,8 @@ def inference(
     use_tf: bool = False,  # dùng TensorFlow (True) hay ONNX (False, tối ưu hơn)
     use_cache: bool = True,
     merge_method: str = "gaussian",
+    print_artifacts: bool = False,
+    generate_artifacts: bool = False,
 ) -> Tuple[ndarray, ndarray]:
     # Load model
     t0 = time.perf_counter()
@@ -189,13 +190,16 @@ def inference(
         if cached is not None:
             class_map, merged, meta = cached
             logger.debug("Loaded inference artifacts from cache: %s", cache_key)
-            # try to generate lightweight artifacts (report/heat) if missing
+            # try to generate lightweight artifacts (report/heat) if requested
             try:
                 out_dir = os.path.dirname(img_path) or os.getcwd()
                 heat = entropy_heatmap(merged)
                 heat_path = os.path.join(out_dir, f"{os.path.basename(img_path)}.entropy.png")
-                cv2.imwrite(heat_path, heat)
-                generate_report(img_path, class_map, merged, {"cached": True}, out_dir=out_dir)
+                if generate_artifacts:
+                    cv2.imwrite(heat_path, heat)
+                    generate_report(img_path, class_map, merged, {"cached": True}, out_dir=out_dir, print_to_stdout=False)
+                elif print_artifacts:
+                    generate_report(img_path, class_map, merged, {"cached": True}, out_dir=out_dir, print_to_stdout=True)
             except Exception:
                 pass
             return class_map, merged
@@ -256,17 +260,18 @@ def inference(
         out_dir = os.path.dirname(img_path) or os.getcwd()
         heat = entropy_heatmap(merged)
         heat_path = os.path.join(out_dir, f"{os.path.basename(img_path)}.entropy.png")
-        cv2.imwrite(heat_path, heat)
 
         low_conf_mask = confidence_filter(merged, threshold=0.6)
 
-        # derive boxes from low confidence mask and create overlay
+        # derive boxes from low confidence mask; create overlay only if requested
         boxes = low_conf_bboxes(low_conf_mask, min_area=64)
-        overlay_path = os.path.join(out_dir, f"{os.path.basename(img_path)}.overlay.png")
-        try:
-            create_overlay(img_path, boxes, overlay_path)
-        except Exception:
-            overlay_path = None
+        overlay_path = None
+        if generate_artifacts:
+            overlay_path = os.path.join(out_dir, f"{os.path.basename(img_path)}.overlay.png")
+            try:
+                create_overlay(img_path, boxes, overlay_path)
+            except Exception:
+                overlay_path = None
 
         report = {
             "image": img_path,
@@ -276,7 +281,11 @@ def inference(
             "low_conf_regions": len(boxes),
             "timings": timings,
         }
-        generate_report(img_path, class_map, merged, report, out_dir=out_dir)
+        # emit report: either write files, print only, or do nothing
+        if generate_artifacts:
+            generate_report(img_path, class_map, merged, report, out_dir=out_dir, print_to_stdout=False)
+        elif print_artifacts:
+            generate_report(img_path, class_map, merged, report, out_dir=out_dir, print_to_stdout=True)
 
         # detect note centers and perform advanced grouping + constraints
         try:
@@ -291,10 +300,9 @@ def inference(
             groups = []
             constrained = []
 
-        # overlay group highlights (draw centroids and group ids)
+        # overlay group highlights: write group overlay only if requested
         try:
-            if centers:
-                # draw circles for centers and group bounding boxes
+            if centers and generate_artifacts:
                 group_overlay = os.path.join(out_dir, f"{os.path.basename(img_path)}.groups.png")
                 img_cv = cv2.imread(img_path)
                 for gi, g in enumerate(groups):
@@ -302,7 +310,6 @@ def inference(
                     for idx in g.get("indices", g):
                         x, y = centers[idx]
                         cv2.circle(img_cv, (x, y), 3, color, -1)
-                    # centroid
                     cx, cy = g.get("centroid", (0,0))
                     cv2.putText(img_cv, str(gi), (cx+2, cy+2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
                 cv2.imwrite(group_overlay, img_cv)
@@ -310,10 +317,13 @@ def inference(
         except Exception:
             pass
 
-        # generate interactive GUI viewer
+        # generate interactive GUI viewer: write files only if requested, otherwise optionally print
         try:
-            html_path = generate_gui(img_path, overlay_path, heat_path, boxes=boxes, out_dir=out_dir)
-            logger.debug("Generated interactive viewer: %s", html_path)
+            if generate_artifacts:
+                html_path = generate_gui(img_path, overlay_path, heat_path, boxes=boxes, out_dir=out_dir, print_to_stdout=False)
+                logger.debug("Generated interactive viewer: %s", html_path)
+            elif print_artifacts:
+                generate_gui(img_path, overlay_path, heat_path, boxes=boxes, out_dir=out_dir, print_to_stdout=True)
         except Exception:
             pass
     except Exception:

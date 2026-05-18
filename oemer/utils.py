@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, TYPE_CHECKING
 import os
 import logging
 
@@ -7,8 +7,55 @@ import numpy as np
 from sklearn.linear_model import LinearRegression
 
 from . import layers
-from oemer.staffline_extraction import Staff
 from typing import Dict
+
+if TYPE_CHECKING:
+    # Import for type checking only to avoid circular imports at runtime
+    from oemer.staffline_extraction import Staff
+
+
+def get_logger(name, level="warn"):
+    """Compatibility logger helper (moved from oemer.logger).
+
+    Kept here so other modules can import get_logger from oemer.utils.
+    The function preserves the previous formatting and LOG_LEVEL behaviour.
+    """
+    logger = logging.getLogger(name)
+    level = os.environ.get("LOG_LEVEL", level)
+
+    msg_formats = {
+        "debug": "%(asctime)s [%(levelname)s] %(message)s  [at %(filename)s:%(lineno)d]",
+        "info": "%(asctime)s %(message)s  [at %(filename)s:%(lineno)d]",
+        "warn": "%(asctime)s %(message)s",
+        "warning": "%(asctime)s %(message)s",
+        "error": "%(asctime)s [%(levelname)s] %(message)s  [at %(filename)s:%(lineno)d]",
+        "critical": "%(asctime)s [%(levelname)s] %(message)s  [at %(filename)s:%(lineno)d]",
+    }
+    level_mapping = {
+        "debug": logging.DEBUG,
+        "info": logging.INFO,
+        "warn": logging.INFO,
+        "warning": logging.WARNING,
+        "error": logging.ERROR,
+        "critical": logging.CRITICAL,
+    }
+
+    date_format = "%Y-%m-%d %H:%M:%S"
+    formatter = logging.Formatter(fmt=msg_formats[level.lower()], datefmt=date_format)
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    if len(logger.handlers) > 0:
+        rm_idx = [idx for idx, handler in enumerate(logger.handlers) if isinstance(handler, logging.StreamHandler)]
+        for idx in rm_idx:
+            del logger.handlers[idx]
+    logger.addHandler(handler)
+    logger.setLevel(level_mapping[level.lower()])
+    return logger
+
+
+def _flatten_valid_staffs(staffs) -> list['Staff']:
+    flat = np.array(staffs, dtype=object).reshape(-1)
+    return [st for st in flat if st is not None]
 
 
 def _ensure_dir(path: str) -> None:
@@ -64,10 +111,13 @@ def count(data, intervals):
     return occur
 
 
-def find_closest_staffs(x: int, y: int) -> Tuple[Staff, Staff]:
+def find_closest_staffs(x: int, y: int) -> Tuple['Staff', 'Staff']:
     staffs = layers.get_layer('staffs')
 
-    staffs = staffs.reshape(-1, 1).squeeze()
+    staffs = _flatten_valid_staffs(staffs)
+    if len(staffs) == 0:
+        raise ValueError("No valid staff objects are available in layer 'staffs'.")
+
     diffs = sorted(staffs, key=lambda st: st - [x, y])
     if len(diffs) == 1:
         return diffs[0], diffs[0]
@@ -117,15 +167,15 @@ def get_unit_size(x: int, y: int) -> float:
 
 def get_global_unit_size() -> float:
     staffs = layers.get_layer('staffs')
-    usize = []
-    for st in staffs.reshape(-1, 1).squeeze():
-        usize.append(st.unit_size)
+    usize = [st.unit_size for st in _flatten_valid_staffs(staffs)]
+    if not usize:
+        raise ValueError("No valid staff objects are available in layer 'staffs'.")
     return sum(usize) / len(usize)
 
 
 def get_total_track_nums() -> int:
     staffs = layers.get_layer('staffs')
-    tracks = [st.track for st in staffs.reshape(-1, 1).squeeze()]
+    tracks = [st.track for st in _flatten_valid_staffs(staffs)]
     return len(set(tracks))
 
 

@@ -12,8 +12,8 @@ from numpy import ndarray
 from scipy.interpolate import interp1d, griddata
 from sklearn.linear_model import LinearRegression
 
-from oemer.morph import morph_open
-from oemer.logger import get_logger
+from oemer.symbol_extraction import morph_open
+from oemer.utils import get_logger
 from oemer.bbox import BBox
 
 

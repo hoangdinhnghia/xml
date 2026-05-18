@@ -103,9 +103,10 @@ def entropy_heatmap(merged: np.ndarray) -> np.ndarray:
     return colored
 
 
-def generate_report(image_path: str, class_map: np.ndarray, merged: np.ndarray, report: dict, out_dir: Optional[str] = None) -> None:
-    out_dir = out_dir or os.path.dirname(image_path) or os.getcwd()
-    os.makedirs(out_dir, exist_ok=True)
+def generate_report(image_path: str, class_map: np.ndarray, merged: np.ndarray, report: dict, out_dir: Optional[str] = None, print_to_stdout: bool = False) -> None:
+    """Generate a report. If `print_to_stdout` is True, print the report to
+    terminal instead of writing files.
+    """
     base = os.path.splitext(os.path.basename(image_path))[0]
 
     r = dict(report)
@@ -121,6 +122,18 @@ def generate_report(image_path: str, class_map: np.ndarray, merged: np.ndarray, 
 
     # basic timing not available here, but keep placeholder
     r.setdefault("notes", 0)
+    if print_to_stdout:
+        # Pretty-print to terminal: text then JSON
+        lines = [f"Report for: {base}", "=" * 60]
+        for k, v in r.items():
+            lines.append(f"{k}: {v}")
+        print("\n".join(lines))
+        print("\nJSON:\n")
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+
+    out_dir = out_dir or os.path.dirname(image_path) or os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
     json_path = os.path.join(out_dir, f"{base}.report.json")
     txt_path = os.path.join(out_dir, f"{base}.report.txt")
 
@@ -183,7 +196,7 @@ def create_overlay(image_path: str, boxes: List[Tuple[int, int, int, int]], out_
     return out_path
 
 
-def generate_gui(image_path: str, overlay_path: Optional[str], heatmap_path: Optional[str], boxes: Optional[List[Tuple[int, int, int, int]]] = None, out_dir: Optional[str] = None) -> str:
+def generate_gui(image_path: str, overlay_path: Optional[str], heatmap_path: Optional[str], boxes: Optional[List[Tuple[int, int, int, int]]] = None, out_dir: Optional[str] = None, print_to_stdout: bool = False) -> str:
     """Generate a simple HTML file to visualize original image, overlay and heatmap.
 
     Returns path to generated HTML file.
@@ -246,6 +259,18 @@ def generate_gui(image_path: str, overlay_path: Optional[str], heatmap_path: Opt
     html.extend(script)
     html.append("<div style='margin-top:10px;'><button onclick='downloadJSON()'>Download review JSON</button></div>")
     html.append("</body></html>")
+
+    if print_to_stdout:
+        print(f"Viewer for: {base}")
+        print("Overlay:", overlay_path)
+        print("Entropy heatmap:", heatmap_path)
+        print("Boxes:")
+        if boxes:
+            for i, b in enumerate(boxes):
+                print(f"  [{i}] {b}")
+        else:
+            print("  (none)")
+        return ""
 
     with open(html_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(html))

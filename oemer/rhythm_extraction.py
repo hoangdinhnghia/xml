@@ -10,18 +10,15 @@ from numpy import ndarray
 
 from oemer import layers
 from oemer.utils import get_unit_size
-from oemer.logger import get_logger
 from oemer.bbox import BBox, get_center, get_rotated_bbox, to_rgb_img, draw_bounding_boxes
 from oemer.notehead_extraction import NoteType
-from oemer.morph import morph_open, morph_close
+from oemer.symbol_extraction import morph_open, morph_close
 
 # Globals
 dot_img: ndarray
 ratio_img: ndarray
 beam_img: ndarray
 ratio_map: ndarray
-
-logger = get_logger(__name__)
 
 
 def scan_dot(
@@ -370,9 +367,9 @@ def scan_beam_flag(
     if end_y < start_y:
         start_y, end_y = end_y, start_y
 
-    unit_size = get_unit_size(start_x, start_y)
-    min_width = unit_size * min_width_ratio
-    max_width = unit_size * max_width_ratio
+    unit_size = max(1.0, get_unit_size(start_x, start_y))
+    min_width = max(1, int(round(unit_size * min_width_ratio)))
+    max_width = max(1, int(round(unit_size * max_width_ratio)))
     for idx, x in enumerate(range(start_x, end_x)):
         cur_y = start_y
         last_val = int(poly_map[cur_y, x])
@@ -414,6 +411,16 @@ def scan_beam_flag(
         accum += num  # type: ignore
         if accum > min_num:
             return c
+    # Fallback: if no consensus but there is measurable beam pixel density
+    # inside the scan window, treat as a single beam. This helps detect thin
+    # single/double beams missed due to noisy edges or narrow widths.
+    try:
+        roi = poly_map[start_y:end_y, start_x:end_x]
+        total_pixels = int(roi.sum())
+        if total_pixels > max(3, len(counter) * 1):
+            return 1
+    except Exception:
+        pass
     return 0
 
 
@@ -539,7 +546,10 @@ def parse_rhythm(beam_map: ndarray, map_info: Dict[int, Dict[str, Any]], agree_t
                 # Could only be whole note
                 for nid in group.note_ids:
                     if notes[nid].label != NoteType.HALF_OR_WHOLE:
-                        notes[nid].invalid = True
+                        # Keep a safe fallback instead of discarding the note.
+                        # Some scores have imperfect stem detection but still
+                        # encode a valid quarter note here.
+                        notes[nid].force_set_label(NoteType.QUARTER)
                         continue
                     notes[nid].force_set_label(NoteType.WHOLE)
             else:
@@ -606,7 +616,10 @@ def parse_rhythm(beam_map: ndarray, map_info: Dict[int, Dict[str, Any]], agree_t
                 if beam_flag_count in note_type_map:
                     notes[nid].label = note_type_map[beam_flag_count]
                 else:
-                    notes[nid].invalid = True
+                    # Fallback to quarter note instead of invalidating.
+                    # This keeps the pipeline usable when beam/flag counting
+                    # misses a symbol on a noisy page.
+                    notes[nid].force_set_label(NoteType.QUARTER)
 
     return beam_img
 
@@ -617,20 +630,14 @@ def extract(
     beam_min_area_ratio: float = 0.07,
     agree_th: float = 0.15
 ) -> Tuple[ndarray, List[RotatedRect]]:
-
-    logger.debug("Parsing dot")
     parse_dot(max_area_ratio=dot_max_area_ratio, min_area_ratio=dot_min_area_ratio)
 
-    logger.debug("Parsing beams and flags")
     poly_map, valid_box, invalid_map = parse_beams(min_area_ratio=beam_min_area_ratio)
 
-    logger.debug("Parsing beam regions")
     out_map, map_info = parse_beam_overlap_regions(poly_map, invalid_map)
 
-    logger.debug("Refining the map info")
     map_info = refine_map_info(map_info)
 
-    logger.debug("Parsing notes rhythm")
     beam_img = parse_rhythm(out_map, map_info, agree_th=agree_th)
     return beam_img, valid_box
 
@@ -663,19 +670,14 @@ if __name__ == "__main__":
     notehead = layers.get_layer('notehead_pred')
     group_map = layers.get_layer('group_map')
 
-    logger.debug("Parsing dot")
     parse_dot()
 
-    logger.debug("Parsing beams and flags")
     poly_map, valid_box, invalid_map = parse_beams()
 
-    logger.debug("Parsing beam regions")
     out_map, map_info = parse_beam_overlap_regions(poly_map, invalid_map)
-
-    logger.debug("Refining the map info")
     map_info = refine_map_info(map_info)
 
-    logger.debug("Parsing notes rhythm")
+    #logger.debug("Parsing notes rhythm")
     beam_img = parse_rhythm(out_map, map_info)
 
     out = draw_notes(notes, ori_img)

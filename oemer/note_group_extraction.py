@@ -8,7 +8,7 @@ from numpy import ndarray
 from oemer import layers
 # avoid circular import: `predict` is imported lazily inside `predict_symbols()`
 from oemer.utils import find_closest_staffs, get_global_unit_size, get_unit_size
-from oemer.logger import get_logger
+from oemer.utils import get_logger
 from oemer.bbox import (
     BBox,
     get_center,

@@ -6,7 +6,7 @@ from PIL import Image
 import cv2
 import numpy as np
 
-from .constant_min import CLASS_CHANNEL_MAP, CHANNEL_NUM
+from .constant import CLASS_CHANNEL_MAP, CHANNEL_NUM
 from .dense_dataset_definitions import DENSE_DATASET_DEFINITIONS as DEF
 
 

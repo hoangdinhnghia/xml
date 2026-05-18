@@ -29,6 +29,21 @@ CLASS_CHANNEL_MAP = {
 CHANNEL_NUM = len(CLASS_CHANNEL_LIST) + 2
 
 
+SEGNET_CLASS_CHANNEL_LIST = [
+    DEF.STEM + DEF.ALL_RESTS_EXCEPT_LARGE + DEF.BARLINE_BETWEEN + DEF.BARLINE_END,
+    DEF.NOTEHEADS_ALL,
+    DEF.ALL_CLEFS + DEF.ALL_KEYS + DEF.ALL_ACCIDENTALS,
+]
+
+SEGNET_CLASS_CHANNEL_MAP = {
+    color: idx + 1
+    for idx, colors in enumerate(SEGNET_CLASS_CHANNEL_LIST)
+    for color in colors
+}
+
+SEGNET_CHANNEL_NUM = len(SEGNET_CLASS_CHANNEL_LIST) + 1  # Plus background channel.
+
+
 class NoteHeadConstant:
     NOTEHEAD_MORPH_WIDTH_FACTOR = 0.5 #0.444444  # Width to unit size factor when morphing
     NOTEHEAD_MORPH_HEIGHT_FACTOR = 0.4 #0.37037  # Height to unit size factor when morphing

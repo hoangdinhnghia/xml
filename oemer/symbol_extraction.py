@@ -11,7 +11,7 @@ from oemer import layers
 from oemer import exceptions as E
 from oemer.inference import predict
 from oemer.utils import get_global_unit_size, slope_to_degree, get_unit_size, find_closest_staffs
-from oemer.logger import get_logger
+from oemer.utils import get_logger
 from oemer.general_filtering_rules import filter_out_of_range_bbox, filter_out_small_area
 from oemer.bbox import (
     BBox,
@@ -24,6 +24,28 @@ from oemer.bbox import (
     get_center,
     to_rgb_img
 )
+
+
+def get_kernel(kernel: Tuple[int, int]) -> ndarray:
+    if isinstance(kernel, tuple):
+        # It is a kernel shape.
+        kernel = np.ones(kernel, dtype=np.uint8)  # type: ignore
+    return kernel  # type: ignore
+
+
+def morph_open(img: ndarray, kernel: Tuple[int, int]) -> ndarray:
+    ker = get_kernel(kernel)
+    return cv2.morphologyEx(img.astype(np.uint8), cv2.MORPH_OPEN, ker)
+
+
+def morph_close(img: ndarray, kernel: Tuple[int, int]) -> ndarray:
+    ker = get_kernel(kernel)
+    return cv2.morphologyEx(img.astype(np.uint8), cv2.MORPH_CLOSE, ker)
+
+
+def morph_hit_miss(img, kernel):
+    ker = get_kernel(kernel)
+    return cv2.morphologyEx(img.astype(np.uint8), cv2.MORPH_HITMISS, ker)
 
 
 # Globals

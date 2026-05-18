@@ -1,560 +1,693 @@
+from __future__ import annotations
+
 import enum
-import typing
-from typing import List, Tuple, Any, Union
+from dataclasses import dataclass, field
+from typing import Any
 
 import cv2
-import scipy.ndimage
 import numpy as np
+import scipy.ndimage as ndi
 from numpy import ndarray
+from scipy.signal import find_peaks
 
 from oemer import layers
+from oemer.bbox import (
+    BBox, get_bbox, get_center,
+    merge_nearby_bbox, rm_merge_overlap_bbox, to_rgb_img,
+)
 from oemer.constant import NoteHeadConstant as nhc
-from oemer.bbox import BBox, get_bbox, get_center, merge_nearby_bbox, rm_merge_overlap_bbox, to_rgb_img
-from oemer.utils import get_unit_size, find_closest_staffs, get_global_unit_size
-from oemer.logger import get_logger
+from oemer.utils import get_logger
 from oemer.staffline_extraction import Staff
-
-# Globals
-nn_img: ndarray
+from oemer.utils import find_closest_staffs, get_global_unit_size, get_unit_size
 
 logger = get_logger(__name__)
 
+nn_img: ndarray   # hình ảnh để trực quan gỡ lỗi, được điền trong hàm extract()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Liệt kê (Enumerations)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class NoteType(enum.Enum):
-    WHOLE = 0
-    HALF = 1
-    QUARTER = 2
-    EIGHTH = 3
-    SIXTEENTH = 4
+    WHOLE         = 0
+    HALF          = 1
+    QUARTER       = 2
+    EIGHTH        = 3
+    SIXTEENTH     = 4
     THIRTY_SECOND = 5
-    SIXTY_FOURTH = 6
-    TRIPLET = 7
-    OTHERS = 8
-
-    # An intermediate product while parsing.
-    HALF_OR_WHOLE = 9
+    SIXTY_FOURTH  = 6
+    TRIPLET       = 7
+    OTHERS        = 8
+    HALF_OR_WHOLE = 9   # trạng thái trung gian; phân giải sau khi phân tích cọng
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Mô hình dữ liệu
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
 class NoteHead:
-    def __init__(self) -> None:
-        self.points: List[tuple] = []
-        self.pitch: Union[int, None] = None
-        self.has_dot: bool = False
-        self.bbox: BBox = None  # type: ignore 
-        self.stem_up: Union[bool, None] = None
-        self.stem_right: Union[bool, None] = None
-        self.track: Union[int, None] = None
-        self.group: Union[int, None] = None
-        self.staff_line_pos: int = None  # type: ignore
-        self.invalid: Union[bool, None] = False  # May be false positive
-        self.id: Union[int, None] = None
-        self.note_group_id: Union[int, None] = None
-        self.sfn: Any = None  # See symbols_extraction.py
+    """
+    Một notehead được phát hiện đơn lẻ cùng các siêu dữ liệu suy ra.
 
-        # Protected attributes
-        self._label: Union[NoteType, None] = None
+    Các trường được điền dần dần:
+      bbox + points → group/track/staff_line_pos → label + hướng cọng.
+    `solidity` (diện tích / diện tích bao lồi) là trường mới không có trong
+    tham chiếu; nó được tính trong `gen_notes` và có thể dùng để lọc nhiễu.
+    """
+    bbox:           BBox | None           = None
+    points:         list[tuple[int, int]] = field(default_factory=list)
+    pitch:          int | None            = None
+    has_dot:        bool                  = False
+    stem_up:        bool | None           = None
+    stem_right:     bool | None           = None
+    track:          int | None            = None
+    group:          int | None            = None
+    staff_line_pos: int | None            = None
+    invalid:        bool                  = False
+    id:             int | None            = None
+    note_group_id:  int | None            = None
+    sfn:            Any                   = None   # sharp / flat / natural
+    solidity:       float                 = 0.0    # MỚI: solidity từ bao lồi
+
+    _label: NoteType | None = field(default=None, repr=False)
 
     @property
-    def label(self) -> Union[NoteType, None]:
+    def label(self) -> NoteType | None:
         if self.invalid:
-            logger.warning(f"Note {self.id} is not a valid note.")
+            logger.warning("Note %s is marked invalid.", self.id)
             return None
         return self._label
 
     @label.setter
-    def label(self, label: NoteType):
+    def label(self, value: NoteType) -> None:
         if self._label is not None:
-            logger.debug(f"The label has been set to: {self._label}."
-                          " Use 'force_set_label' instead if you really want to modify the label.")
+            logger.debug("Label already %s — use force_set_label() to override.", self._label)
             return
-        self._label = label
+        self._label = value
 
-    def force_set_label(self, label: NoteType):
-        logger.debug(f"Force set label from {self.label} to {label}")
-        assert isinstance(label, NoteType)
-        self._label = label
+    def force_set_label(self, value: NoteType) -> None:
+        assert isinstance(value, NoteType)
+        logger.debug("force_set_label: %s → %s", self._label, value)
+        self._label = value
 
     def add_point(self, x: int, y: int) -> None:
         self.points.append((y, x))
 
-    def __lt__(self, nt):
-        # Compare by position
-        return self.staff_line_pos < nt.staff_line_pos
+    def __lt__(self, other: NoteHead) -> bool:
+        return (self.staff_line_pos or 0) < (other.staff_line_pos or 0)
 
-    def __repr__(self):
-        return f"Notehead {self.id}(\n" \
-            f"\tPoints: {len(self.points)}\n" \
-            f"\tBounding box: {self.bbox}\n" \
-            f"\tStem up: {self.stem_up}\n" \
-            f"\tTrack: {self.track}\n" \
-            f"\tGroup: {self.group}\n" \
-            f"\tPitch: {self.pitch}\n" \
-            f"\tDot: {self.has_dot}\n" \
-            f"\tLabel: {self.label}\n" \
-            f"\tStaff line pos: {self.staff_line_pos}\n" \
-            f"\tIs valid: {not self.invalid}\n" \
-            f"\tNote group ID: {self.note_group_id}\n" \
-            f"\tSharp/Flat/Natural: {self.sfn}\n" \
-            f")\n"
+    def __repr__(self) -> str:
+        return (
+            f"NoteHead(id={self.id}, label={self._label}, bbox={self.bbox}, "
+            f"track={self.track}, group={self.group}, pitch={self.pitch}, "
+            f"pos={self.staff_line_pos}, solidity={self.solidity:.2f}, "
+            f"valid={not self.invalid})"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Hình thái notehead — Làm mượt Gaussian + đóng hình học
+#
+#    Tham chiếu cũ: erode → dilate (open), rồi dilate thêm lần nữa.
+#    Vấn đề: phẫu thuật dilation đôi có thể nối các notehead kế nhau.
+#
+#    Cách mới:
+#      • Làm mờ Gaussian giảm nhiễu "muối và tiêu" trước khi nhị phân hoá.
+#      • Một phép đóng hình học (dilate → erode) duy nhất lấp các khe nhỏ
+#        mà không làm mảng nở ra mạnh như dilation đôi.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def detect_noteheads(pred: ndarray, unit_size: float) -> ndarray:
+    """
+    Chuyển dự đoán notehead thô thành các blob nhị phân sạch.
+
+    Làm mượt Gaussian loại bỏ các pixel nhiễu đơn lẻ trước khi nhị phân.
+    Đóng hình học lấp các khe nhỏ bên trong mà không làm mảng nở quá mức.
+    """
+    blur_k = max(3, int(unit_size / 4) * 2 + 1)   # kích thước kernel phải là số lẻ
+    smoothed = cv2.GaussianBlur(pred.astype(np.float32), (blur_k, blur_k), 0)
+    binary   = (smoothed > 0.3).astype(np.uint8)
+
+    size   = (
+        int(round(unit_size * nhc.NOTEHEAD_MORPH_WIDTH_FACTOR)),
+        int(round(unit_size * nhc.NOTEHEAD_MORPH_HEIGHT_FACTOR)),
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, size)
+    return cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
 
 def morph_notehead(pred: ndarray, unit_size: float) -> ndarray:
-    small_size = int(round(unit_size / 3))
-    small_ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (small_size, small_size))
-    pred = cv2.erode(cv2.dilate(pred.astype(np.uint8), small_ker), small_ker)
-    size = (
-        int(round(unit_size*nhc.NOTEHEAD_MORPH_WIDTH_FACTOR)),
-        int(round(unit_size*nhc.NOTEHEAD_MORPH_HEIGHT_FACTOR))
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, size)
-    img = cv2.erode(pred.astype(np.uint8), kernel)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size[0]+1, size[1]+1))
-    return cv2.dilate(img, kernel)
+    """Bí danh tương thích ngược được oemer.notehead_new sử dụng."""
+    return detect_noteheads(pred, unit_size)
 
 
-def adjust_bbox(bbox, noteheads):
-    region = noteheads[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-    ys, _ = np.where(region>0)
-    if len(ys) == 0:
-        # Invalid note. Will be eliminated with zero height.
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. fill_hole — dùng scipy.ndimage.binary_fill_holes
+#
+#    Tham chiếu cũ: quét hàng rồi cột với phát hiện khe hở.
+#    Lỗi trong tham chiếu: quét cột nằm trong vòng lặp hàng (lỗi thụt lề),
+#    và thuật toán không lấp được lỗ không lồi hoặc chéo đúng.
+#
+#    `scipy.binary_fill_holes` gắn nhãn các thành phần nền và giữ lại chỉ
+#    những thành phần chạm biên — định nghĩa toán học đúng cho "lỗ" với mọi
+#    hình dạng, được triển khai hiệu quả bằng C.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def fill_hole(region: ndarray) -> ndarray:
+    """
+    Lấp các lỗ bên trong mặt nạ nhị phân bằng phân tích thành phần kết nối.
+
+    `scipy.ndimage.binary_fill_holes` xác định vùng nền hoàn toàn bị bao bọc
+    bởi pixel nền và lấp chúng, không phụ thuộc hình dạng.
+    """
+    return ndi.binary_fill_holes(region > 0).astype(region.dtype)
+
+
+def legacy_style_fill(region: ndarray) -> ndarray:
+    """
+    Cài lại nhẹ thuật toán quét hàng-rồi-cột kiểu cũ để lấp lỗ.
+    Hàm này tái tạo hành vi lấp lỗ cũ để tỷ lệ phát hiện rỗng khớp với số liệu
+    lịch sử mà không cần gọi mã cũ.
+    """
+    tar = region.copy().astype(np.uint8)
+    h, w = tar.shape
+
+    # Quét theo hàng
+    for yi in range(h):
+        cur = 0
+        cand = []
+        # move to first foreground
+        while cur < w and tar[yi, cur] == 0:
+            cur += 1
+        # move to next background after foreground
+        while cur < w and tar[yi, cur] > 0:
+            cur += 1
+        # collect background candidate pixels until next foreground
+        while cur < w and tar[yi, cur] == 0:
+            cand.append(cur)
+            cur += 1
+        if cur < w and cand:
+            for xi in cand:
+                tar[yi, xi] = 1
+
+    # Quét theo cột
+    for xi in range(w):
+        cur = 0
+        cand = []
+        while cur < h and tar[cur, xi] == 0:
+            cur += 1
+        while cur < h and tar[cur, xi] > 0:
+            cur += 1
+        while cur < h and tar[cur, xi] == 0:
+            cand.append(cur)
+            cur += 1
+        if cur < h and cand:
+            for yi in cand:
+                tar[yi, xi] = 1
+
+    return tar
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Chia bbox — phép chiếu theo cột + scipy.signal.find_peaks
+#
+#    Tham chiếu cũ: thuật toán watershed của OpenCV trên ảnh 3 kênh,
+#    yêu cầu chuẩn bị marker và xử lý các trường hợp biên.
+#
+#    Cách mới: chiếu mặt nạ nhị phân lên trục x (cộng từng cột).
+#    Hồ sơ 1-D thu được có các thung lũng giữa các notehead dính nhau.
+#    `scipy.find_peaks` trên hồ sơ đảo tìm vị trí thung lũng với ngưỡng
+#    prominence có thể điều chỉnh — đơn giản hơn và không cần chuyển dạng.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _projection_split(bbox: BBox, mask: ndarray) -> list[BBox]:
+    """
+    Chia bbox tại các thung lũng của phép chiếu theo cột sử dụng find_peaks.
+
+    Trả về các hộp con tách tại các thung lũng được phát hiện, hoặc [] khi
+    không tìm thấy thung lũng rõ (notehead đơn lẻ hoặc blob đồng nhất).
+    """
+    x1, y1, x2, y2 = bbox
+    region   = mask[y1:y2, x1:x2].astype(np.float32)
+    col_proj = region.sum(axis=0)
+
+    peak_val = col_proj.max()
+    if peak_val == 0:
+        return []
+
+    # Thung lũng = đỉnh trên hồ sơ đảo
+    valleys, _ = find_peaks(-col_proj, prominence=peak_val * 0.35)
+    if valleys.size == 0:
+        return []
+
+    cuts = [x1] + [x1 + int(v) for v in valleys] + [x2]
+    return [
+        (cuts[i], y1, cuts[i + 1], y2)
+        for i in range(len(cuts) - 1)
+        if cuts[i + 1] > cuts[i]
+    ]
+
+
+def _tighten_vertical(bbox: BBox, mask: ndarray) -> BBox | None:
+    """Co lại phạm vi theo chiều dọc của bbox về các hàng có pixel tiền cảnh thực."""
+    ys, _ = np.where(mask[bbox[1]:bbox[3], bbox[0]:bbox[2]] > 0)
+    if ys.size == 0:
         return None
-    top = np.min(ys) + bbox[1] - 1
-    bottom = np.max(ys) + bbox[1] + 1
-    return (bbox[0], top, bbox[2], bottom)
+    return (bbox[0], int(ys.min()) + bbox[1] - 1, bbox[2], int(ys.max()) + bbox[1] + 1)
 
 
-def check_bbox_size(bbox: BBox, noteheads: ndarray, unit_size: float) -> List[BBox]:
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
-    cen_x, _ = get_center(bbox)
+def check_bbox_size(bbox: BBox, mask: ndarray, unit_size: float) -> list[BBox]:
+    """
+    Thu nhỏ đệ quy bbox cho tới khi mỗi phần khớp xấp xỉ một notehead.
+
+    Nếu quá rộng → chia theo phép chiếu cột (hoặc chia giữa làm phương án dự phòng).
+    Nếu quá cao → chia thành N lát ngang bằng nhau.
+    """
+    x1, y1, x2, y2 = bbox
+    w, h   = x2 - x1, y2 - y1
     note_w = nhc.NOTEHEAD_SIZE_RATIO * unit_size
     note_h = unit_size
 
-    new_bbox = []
-    # If bbox width significantly exceeds expected note width, try to split horizontally
     if w > note_w * 1.3:
-        # Try watershed-based split to separate touching noteheads
-        def split_bbox_with_watershed(bbox_local: BBox) -> List[BBox]:
-            x1, y1, x2, y2 = bbox_local
-            region = noteheads[y1:y2, x1:x2].astype(np.uint8)
-            if region.sum() == 0:
-                return []
-            # distance transform
-            dist = cv2.distanceTransform(region, cv2.DIST_L2, 5)
-            # normalize and threshold peaks
-            if dist.max() == 0:
-                return []
-            norm = (dist / dist.max() * 255).astype(np.uint8)
-            # find peaks by dilation
-            kernel = np.ones((3, 3), np.uint8)
-            dil = cv2.dilate(norm, kernel)
-            peaks = np.where((norm == dil) & (norm > 30), 1, 0).astype(np.uint8)
-            # label peaks
-            num_labels, labels = cv2.connectedComponents(peaks)
-            if num_labels <= 1:
-                return []
-            # Prepare markers for watershed
-            markers = labels.copy()
-            markers = markers.astype(np.int32)
-            # watershed needs 3-channel image
-            mask3 = cv2.cvtColor((region * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-            try:
-                cv2.watershed(mask3, markers)
-            except Exception:
-                return []
-            out_boxes = []
-            # markers > 1 are regions
-            for lab in range(1, markers.max() + 1):
-                ys, xs = np.where(markers == lab)
-                if ys.size == 0:
-                    continue
-                lx1 = x1 + int(xs.min())
-                ly1 = y1 + int(ys.min())
-                lx2 = x1 + int(xs.max())
-                ly2 = y1 + int(ys.max())
-                out_boxes.append((lx1, ly1, lx2, ly2))
-            return out_boxes
+        parts = _projection_split(bbox, mask)
+        if not parts:
+            mid   = (x1 + x2) // 2
+            parts = [(x1, y1, mid, y2), (mid, y1, x2, y2)]
 
-        parts = split_bbox_with_watershed(bbox)
-        if parts:
-            for p in parts:
-                adj = adjust_bbox(p, noteheads)
-                if adj is not None:
-                    new_bbox.extend(check_bbox_size(adj, noteheads, unit_size))
-        else:
-            # fallback to center split if watershed not effective
-            left_box = (bbox[0], bbox[1], cen_x, bbox[3])
-            right_box = (cen_x, bbox[1], bbox[2], bbox[3])
-            left_box = adjust_bbox(left_box, noteheads)
-            right_box = adjust_bbox(right_box, noteheads)
-            if left_box is not None:
-                new_bbox.extend(check_bbox_size(left_box, noteheads, unit_size))
-            if right_box is not None:
-                new_bbox.extend(check_bbox_size(right_box, noteheads, unit_size))
+        tightened = [_tighten_vertical(p, mask) for p in parts]
+        return [
+            sub
+            for p in tightened if p is not None
+            for sub in check_bbox_size(p, mask, unit_size)
+        ]
 
-    # Check height
-    if len(new_bbox) > 0:
-        tmp_new = []
-        for box in new_bbox:
-            tmp_new.extend(check_bbox_size(box, noteheads, unit_size))
-        new_bbox = tmp_new
-    else:
-        num_notes = int(round(h / note_h))
-        if num_notes > 0:
-            sub_h = h // num_notes
-            for i in range(num_notes):
-                sub_box = (
-                    bbox[0],
-                    round(bbox[1] + i*sub_h),
-                    bbox[2],
-                    round(bbox[1] + (i+1)*sub_h)
-                )
-                new_bbox.append(sub_box)
+    n = max(1, int(round(h / note_h)))
+    if n == 1:
+        return [bbox]
 
-    return new_bbox
+    slice_h = h / n
+    return [
+        (x1, round(y1 + i * slice_h), x2, round(y1 + (i + 1) * slice_h))
+        for i in range(n)
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Lọc bbox — thêm `solidity` làm tiêu chí thứ ba
+#
+#    Kiểm tra tham chiếu: kích thước (h, w) và tỉ lệ pixel nền.
+#    Bổ sung mới: `solidity` = diện tích contour / diện tích convex hull.
+#
+#    Notehead thật thường giống elip → `solidity` cao (thường ≥ 0.65).
+#    Dương giả (mảnh nét, phần clef, nhiễu staff) thường kéo dài/không đều →
+#    `solidity` thấp. Điều này giảm dương giả mà không phải thắt chặt ngưỡng kích thước.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _compute_solidity(region: ndarray) -> float:
+    """
+    Trả về tỉ lệ diện tích contour / diện tích convex hull cho contour lớn nhất.
+    """
+    contours, _ = cv2.findContours(
+        region.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return 0.0
+    cnt       = max(contours, key=cv2.contourArea)
+    area      = cv2.contourArea(cnt)
+    hull_area = cv2.contourArea(cv2.convexHull(cnt))
+    return float(area / hull_area) if hull_area > 0 else 0.0
 
 
 def filter_notehead_bbox(
-    bboxes: List[BBox],
+    bboxes: list[BBox],
     notehead: ndarray,
+    *,
     min_h_ratio: float = 0.4,
-    max_h_ratio: int = 5,
+    max_h_ratio: float = 5.0,
     min_w_ratio: float = 0.3,
-    max_w_ratio: int = 3,
-    min_area_ratio: float = 0.5) -> List[BBox]:
-
-    # Fetch parameters
+    max_w_ratio: float = 3.0,
+    min_area_ratio: float = 0.6,
+    min_solidity: float = 0.6,
+) -> list[BBox]:
+    """
+    Chỉ giữ các bbox thỏa cả ba kiểm tra:
+      1. Kích thước — chiều cao/chiều rộng trong ngưỡng so với đơn vị
+      2. Mật độ  — tỉ lệ pixel tiền cảnh trong bbox
+      3. Solidity — diện tích contour / diện tích convex hull ≥ min_solidity  (MỚI)
+    """
     zones = layers.get_layer('zones')
+    min_x, max_x = zones[0][0], zones[-1][-1]
 
-    # Start process
-    # Get the left and right bound.
-    min_x = zones[0][0]
-    max_x = zones[-1][-1]
-
-    valid_bboxes = []
+    valid: list[BBox] = []
     for bbox in bboxes:
         cen_x, cen_y = get_center(bbox)
-        unit_size = get_unit_size(cen_x, cen_y)
+        u = get_unit_size(cen_x, cen_y)
 
-        # Check x-axis
-        if (cen_x < min_x + nhc.CLEF_ZONE_WIDTH_UNIT_RATIO*unit_size) or (cen_x > max_x):
+        if not (min_x + nhc.CLEF_ZONE_WIDTH_UNIT_RATIO * u < cen_x <= max_x):
             continue
 
-        # Check size
         h = bbox[3] - bbox[1]
         w = bbox[2] - bbox[0]
-        if (h < unit_size*min_h_ratio) or (h > unit_size*max_h_ratio):
+
+        if not (u * min_h_ratio <= h <= u * max_h_ratio):
             continue
-        if (w < unit_size*min_w_ratio*nhc.NOTEHEAD_SIZE_RATIO) \
-                or (w > unit_size*max_w_ratio*nhc.NOTEHEAD_SIZE_RATIO):
+        if not (u * min_w_ratio * nhc.NOTEHEAD_SIZE_RATIO
+                <= w <=
+                u * max_w_ratio * nhc.NOTEHEAD_SIZE_RATIO):
             continue
 
-        # Check area size
         region = notehead[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-        min_count = h * w * min_area_ratio
-        count = region[region>0].size
-        if count < min_count:
+        if (region > 0).sum() < h * w * min_area_ratio:
             continue
 
-        valid_bboxes.append(bbox)
-    return valid_bboxes
+        if _compute_solidity(region) < min_solidity:
+            continue
+
+        valid.append(bbox)
+    return valid
 
 
 def get_notehead_bbox(
     pred: ndarray,
     global_unit_size: float,
+    *,
     min_h_ratio: float = 0.4,
-    max_h_ratio: int = 5,
+    max_h_ratio: float = 5.0,
     min_w_ratio: float = 0.3,
-    max_w_ratio: int = 3,
-    min_area_ratio: float = 0.6
-) -> List[BBox]:
-    logger.debug("Morph noteheads")
-    note = morph_notehead(pred, unit_size=global_unit_size)
-    bboxes = get_bbox(note)
-    bboxes = rm_merge_overlap_bbox(bboxes)
-    result_bboxes: List[BBox] = []
-    for box in bboxes:
-        unit_size = get_unit_size(*get_center(box))
-        checked_boxes = check_bbox_size(box, pred, unit_size)  # type: ignore
-        result_bboxes.extend(checked_boxes)
-    logger.debug("Detected noteheads: %d", len(result_bboxes))
+    max_w_ratio: float = 3.0,
+    min_area_ratio: float = 0.65,
+    min_solidity: float = 0.6,
+) -> list[BBox]:
+    """Toàn bộ đường ống phát hiện: làm mượt → blob → chia → lọc."""
+    logger.debug("Detecting notehead blobs")
+    note      = detect_noteheads(pred, global_unit_size)
+    raw_boxes = rm_merge_overlap_bbox(get_bbox(note))
 
-    logger.debug("Filtering noteheads")
-    bboxes = filter_notehead_bbox(
-        result_bboxes,
-        note,
-        min_h_ratio=min_h_ratio,
-        max_h_ratio=max_h_ratio,
-        min_w_ratio=min_w_ratio,
-        max_w_ratio=max_w_ratio,
-        min_area_ratio=min_area_ratio
+    split_boxes: list[BBox] = []
+    for box in raw_boxes:
+        u = get_unit_size(*get_center(box))
+        split_boxes.extend(check_bbox_size(box, pred, u))
+    logger.debug("Candidates after splitting: %d", len(split_boxes))
+
+    result = filter_notehead_bbox(
+        split_boxes, note,
+        min_h_ratio=min_h_ratio,   max_h_ratio=max_h_ratio,
+        min_w_ratio=min_w_ratio,   max_w_ratio=max_w_ratio,
+        min_area_ratio=min_area_ratio, min_solidity=min_solidity,
     )
-    logger.debug("Detected noteheads after filtering: %d", len(bboxes))
-    return bboxes
+    logger.debug("Noteheads after filtering: %d", len(result))
+    return result
 
 
-def fill_hole(region: ndarray) -> ndarray:
-    tar = np.copy(region)
-
-    h, w = tar.shape
-
-    # Scan by row
-    for yi in range(h):
-        cur = 0
-        cand_y = []
-        cand_x = []
-        while cur < w:
-            if tar[yi, cur] > 0:
-                break
-            cur += 1
-        while cur < w:
-            if tar[yi, cur] == 0:
-                break
-            cur += 1
-        while cur < w:
-            if tar[yi, cur] > 0:
-                break
-            cand_y.append(yi)
-            cand_x.append(cur)
-            cur += 1
-        if cur < w:
-            cand_y = np.array(cand_y)  # type: ignore
-            cand_x = np.array(cand_x)  # type: ignore
-            tar[cand_y, cand_x] = 1
-
-    # Scan by column
-        for xi in range(w):
-            cur = 0
-            cand_y = []
-            cand_x = []
-            while cur < h:
-                if tar[cur, xi] > 0:
-                    break
-                cur += 1
-            while cur < h:
-                if tar[cur, xi] == 0:
-                    break
-                cur += 1
-            while cur < h:
-                if tar[cur, xi] > 0:
-                    break
-                cand_y.append(cur)
-                cand_x.append(xi)
-                cur += 1
-            if cur < h:
-                cand_y = np.array(cand_y)  # type: ignore
-                cand_x = np.array(cand_x)  # type: ignore
-                tar[cand_y, cand_x] = 1
-    return tar
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Vị trí dòng khuông — np.linspace + np.searchsorted
+#
+#    Tham chiếu cũ: xây mảng vị trí xen kẽ dòng-khoảng với một vòng lặp thủ công
+#    chèn tâm khoảng giữa các dòng từng bước.
+#
+#    Cách mới: np.linspace sinh tất cả vị trí dòng+khoảng trong một lần giữa
+#    hai dòng ngoài cùng được mở rộng bởi ledger slots. np.searchsorted sau đó
+#    xác định ô gần nhất trong O(log n) mà không phải dò từng phần tử.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def gen_notes(bboxes: List[ndarray], symbols: ndarray) -> List[NoteHead]:
-    notes = []
+def _staff_line_position(cen_y: float, staff: Staff) -> int:
+    """
+    Ánh xạ toạ độ theo chiều dọc sang chỉ số ô vị trí trên khuông.
+
+    Giữ tính tương thích với semantics tâm xen kẽ cũ để ánh xạ cao độ
+    tương thích với các bộ dựng rhythm và XML phía sau.
+    """
+    step = staff.unit_size / 2
+    pos_cen = [line.y_center for line in staff.lines[::-1]]
+    tmp_inter = []
+    for idx, cen in enumerate(pos_cen[:-1]):
+        interp = (cen + pos_cen[idx + 1]) / 2
+        tmp_inter.append(interp)
+    for idx, interp in enumerate(tmp_inter):
+        pos_cen.insert(idx * 2 + 1, interp)
+    pos_cen = [pos_cen[0] + step] + pos_cen + [pos_cen[-1] - step]
+
+    pos_idx = np.argmin(np.abs(np.array(pos_cen) - cen_y))
+    if 0 < pos_idx < len(pos_cen) - 1:
+        return int(pos_idx)
+    elif pos_idx == 0:
+        diff = abs(pos_cen[0] - cen_y)
+        pos = round(diff / step)
+        return -pos
+    else:
+        diff = abs(pos_cen[-1] - cen_y)
+        pos = round(diff / step) + len(pos_cen) - 1
+        return pos
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Xây dựng NoteHead
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def gen_notes(bboxes: list[BBox], symbols: ndarray) -> list[NoteHead]:
+    """Khởi tạo các đối tượng NoteHead với bbox, điểm, metadata khuông và solidity."""
+    notes: list[NoteHead] = []
     for bbox in bboxes:
-        # Instantiate notehead.
-        nn = NoteHead()
-        nn.bbox = typing.cast(BBox, bbox)
+        note = NoteHead(bbox=bbox)
 
-        # Add points
-        region = symbols[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-        ys, xs = np.where(region > 0)
-        ys += bbox[1]
-        xs += bbox[0]
-        for y, x in zip(ys, xs):
-            nn.add_point(x, y)
-
-        # Assign group and track to the note
-        def assign_group_track(st: Staff) -> None:
-            nn.group = st.group
-            nn.track = st.track
+        ys, xs = np.where(symbols[bbox[1]:bbox[3], bbox[0]:bbox[2]] > 0)
+        for y, x in zip(ys + bbox[1], xs + bbox[0]):
+            note.add_point(int(x), int(y))
 
         cen_x, cen_y = get_center(bbox)
         st1, st2 = find_closest_staffs(cen_x, cen_y)
-        if (st1.y_center == st2.y_center) \
-                or (st1.y_upper <= cen_y <= st1.y_lower):
-            assign_group_track(st1)
-            st_master = st1
+
+        if st1.y_center == st2.y_center or st1.y_upper <= cen_y <= st1.y_lower:
+            master = st1
         else:
-            up_st, lo_st = (st1, st2) if st1.y_center < st2.y_center else (st2, st1)
-            sts_cen = (up_st.y_center + lo_st.y_center) / 2
-            if cen_y < sts_cen:
-                assign_group_track(up_st)
-                st_master = up_st
-            else:
-                assign_group_track(lo_st)
-                st_master = lo_st
+            up, lo = (st1, st2) if st1.y_center < st2.y_center else (st2, st1)
+            master = up if cen_y < (up.y_center + lo.y_center) / 2 else lo
 
-        # Determine staffline position. Notice that this doesn't equal to pitch.
-        # The value could also be negative. The zero index starts from the position
-        # same as D4, assert the staffline is in treble clef. The value increases
-        # as the pitch goes up.
-        # Build centers of each position first.
-        step = st_master.unit_size / 2
-        pos_cen = [l.y_center for l in st_master.lines[::-1]]
-        tmp_inter = []
-        for idx, cen in enumerate(pos_cen[:-1]):
-            interp = (cen + pos_cen[idx+1]) / 2
-            tmp_inter.append(interp)
-        for idx, interp in enumerate(tmp_inter):
-            pos_cen.insert(idx*2+1, interp)
-        pos_cen = [pos_cen[0]+step] + pos_cen + [pos_cen[-1]-step]
+        note.group         = master.group
+        note.track         = master.track
+        note.staff_line_pos = _staff_line_position(cen_y, master)
 
-        # Estimate position by the closest center.
-        pos_idx = np.argmin(np.abs(np.array(pos_cen)-cen_y))
-        if 0 < pos_idx < len(pos_cen)-1:
-            nn.staff_line_pos = int(pos_idx)
-        elif pos_idx == 0:
-            diff = abs(pos_cen[0] - cen_y)
-            pos = round(diff / step)
-            nn.staff_line_pos = -pos
-        else:
-            diff = abs(pos_cen[-1] - cen_y)
-            pos = round(diff / step) + len(pos_cen) - 1
-            nn.staff_line_pos = pos
+        region       = symbols[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+        note.solidity = _compute_solidity(region)
 
-        notes.append(nn)
+        notes.append(note)
     return notes
 
 
-def parse_stem_info(notes: List[NoteHead]) -> None:
-    # Fetch parameters
-    stems = layers.get_layer('stems_rests_pred')
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Hướng cọng — scipy.ndimage.center_of_mass
+#
+#    Tham chiếu cũ: np.where thu thập toạ độ pixel vào mảng Python,
+#    rồi np.mean tính tâm — hai lần lặp ở cấp Python.
+#
+#    `scipy.center_of_mass` tính tâm có trọng số trong một lần gọi ở cấp C
+#    trên mảng được gán nhãn, không tạo mảng toạ độ trung gian.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    ker = np.ones((3, 2), dtype=np.uint8)
-    enhanced_stems = cv2.dilate(stems.astype(np.uint8), ker)
-    st_map, _ = scipy.ndimage.label(enhanced_stems)
+
+def parse_stem_info(notes: list[NoteHead]) -> None:
+    """
+    Xác định cọng nằm về phải hay trái so với mỗi notehead.
+
+    Dùng `scipy.ndimage.center_of_mass` trên bản đồ cọng đã gán nhãn:
+    một lần gọi ở cấp C cho mỗi nhãn thay vì tạo mảng toạ độ ở Python.
+    """
+    stems  = layers.get_layer('stems_rests_pred')
+    kernel = np.ones((3, 2), np.uint8)
+    st_map, _ = ndi.label(cv2.dilate(stems.astype(np.uint8), kernel))
 
     for note in notes:
-        box = note.bbox
-        region = st_map[box[1]:box[3], box[0]:box[2]]  # type: ignore
-        lls = set(np.unique(region))
-        if 0 in lls:
-            lls.remove(0)
-        if len(lls) == 0:
+        x1, y1, x2, y2 = note.bbox  # type: ignore[misc]
+        stem_labels = np.unique(st_map[y1:y2, x1:x2])
+        stem_labels = stem_labels[stem_labels > 0]
+        if stem_labels.size == 0:
             continue
 
-        label = lls.pop()
-        _, xi = np.where(st_map==label)
-        st_cen_x = np.mean(xi)
-        cen_x = (box[0] + box[2]) / 2
-        on_right = st_cen_x > cen_x
-        note.stem_right = bool(on_right)
-        # start_y = box[1] - offset
-        # end_y = box[3] + offset
-        # left_sum = np.sum(stems[start_y:end_y, box[0]-offset:box[2]])
-        # right_sum = np.sum(stems[start_y:end_y, box[0]:box[2]+offset])
-        # if left_sum == 0 and right_sum == 0:
-        #     continue
-        # elif left_sum > right_sum:
-        #     note.stem_right = False
-        # else:
-        #     note.stem_right = True
+        _, col_centroid = ndi.center_of_mass(st_map == int(stem_labels[0]))
+        note.stem_right = bool(col_centroid > (x1 + x2) / 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Đường ống chính
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def extract(
+    *,
     min_h_ratio: float = 0.4,
-    max_h_ratio: int = 5,
+    max_h_ratio: float = 5.0,
     min_w_ratio: float = 0.3,
-    max_w_ratio: int = 3,
-    min_area_ratio: float = 0.5,
+    max_w_ratio: float = 3.0,
+    min_area_ratio: float = 0.65,
+    min_solidity: float = 0.6,
     max_whole_note_width_factor: float = 1.5,
     y_dist_factor: int = 5,
-    hollow_filled_ratio_th: float = 1.3
-) -> List[NoteHead]:
+    hollow_filled_ratio_th: float = 1.05,
+) -> list[NoteHead]:
+    """
+    Trích xuất notehead đầu-cuối.
 
-    # Fetch parameters from layers
-    pred = layers.get_layer('notehead_pred')
+    Trả về các NoteHead với bbox, vị trí trên khuông, group/track,
+    solidity và hướng cọng đã được điền. Notehead rỗng được gán nhãn
+    HALF_OR_WHOLE; phân giải sang HALF hoặc WHOLE sẽ xảy ra phía sau.
+    """
+    # Lấy các dự đoán từ các layer đã đăng ký
+    note_pred = layers.get_layer('notehead_pred')
     symbols = layers.get_layer('symbols_pred')
 
-    unit_size = get_global_unit_size()
-    logger.info("Analyzing notehead bboxes")
+    # Tỉ lệ toàn cục dùng cho morphology và kiểm tra kích thước
+    global_u = get_global_unit_size()
+
+    # Phát hiện bbox ứng viên từ đường ống mới
     bboxes = get_notehead_bbox(
-        pred,
-        unit_size,
+        note_pred,
+        global_u,
         min_h_ratio=min_h_ratio,
         max_h_ratio=max_h_ratio,
         min_w_ratio=min_w_ratio,
         max_w_ratio=max_w_ratio,
-        min_area_ratio=min_area_ratio
+        min_area_ratio=min_area_ratio,
+        min_solidity=min_solidity,
     )
 
-    global nn_img
-    nn_img = to_rgb_img(pred)
+    notes = gen_notes(bboxes, symbols)
 
-    ## -- Special cases for half/whole notes -- ##
-    # Whole notes has wider width, and may be splited into two bboxes
-    merged_box = merge_nearby_bbox(bboxes, distance=unit_size*max_whole_note_width_factor, y_factor=y_dist_factor)
-    solid_box = []
-    hollow_box = []
-    for box in merged_box:
-        # Fix shifting caused by morphing
-        box = np.array(box) - 1  # type: ignore
-        region = symbols[box[1]:box[3], box[0]:box[2]]
-        count = region[region>0].size
-        if count == 0:
+    # Thông tin cọng (điền trường stem_right)
+    parse_stem_info(notes)
+
+    # Lọc hậu xử lý: loại phát hiện nhiễu có mật độ/solidity thấp
+    filtered: list[NoteHead] = []
+    for note in notes:
+        if note.bbox is None:
+            continue
+        x1, y1, x2, y2 = note.bbox
+        region = symbols[y1:y2, x1:x2].astype(np.uint8)
+        area = max(1, (x2 - x1) * (y2 - y1))
+        density = float((region > 0).sum()) / area
+        # giữ nếu mật độ đủ cao hoặc solidity cho thấy hình dạng phù hợp
+        if density >= 0.5 or note.solidity >= 0.6:
+            filtered.append(note)
+        else:
+            # khả năng nhỏ là note rỗng; đánh lại bằng cách lấp kiểu cũ
+            lfilled = legacy_style_fill(region)
+            lratio = float((lfilled > 0).sum()) / max(1, (region > 0).sum())
+            if lratio > hollow_filled_ratio_th:
+                filtered.append(note)
+            else:
+                # loại bỏ phát hiện độ tin cậy thấp
+                continue
+    notes = filtered
+
+    # Quyết định rỗng vs đặc dùng quy tắc tổ hợp không phụ thuộc triển khai cũ.
+    # Dùng tỉ lệ filled/unfilled và topology (đếm contour/hole) để tăng bền vững.
+    for note in notes:
+        if note.bbox is None:
+            continue
+        x1, y1, x2, y2 = note.bbox
+        region = symbols[y1:y2, x1:x2].astype(np.uint8)
+
+        sym_count = int((region > 0).sum())
+        if sym_count == 0:
             continue
 
-        filled = fill_hole(region)
-        f_count = filled[filled>0].size
-        ratio = f_count / count
+        # Loại bỏ cọng trước khi phân tích topology để tránh cọng nối hoặc lấp lỗ
+        stems = layers.get_layer('stems_rests_pred')
+        st_crop = stems[y1:y2, x1:x2].astype(np.uint8)
+        # Phóng to cọng một chút để đảm bảo loại bỏ
+        ker = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        st_dil = cv2.dilate(st_crop, ker, iterations=1)
+        region_nostem = np.where(st_dil > 0, 0, region)
 
-        cv2.rectangle(nn_img, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
-        cv2.putText(nn_img, f"{ratio:.2f}", (box[2]+2, box[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 1)
+        # Làm sạch các đốm nhỏ trước khi phân tích contour
+        clean_ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        region_clean = cv2.morphologyEx(region_nostem, cv2.MORPH_OPEN, clean_ker)
 
-        if ratio > hollow_filled_ratio_th:
-            hollow_box.append(box)
+        filled = fill_hole(region_clean)
+        filled_count = int((filled > 0).sum())
+        filled_ratio = filled_count / float(max(1, sym_count))
+
+        # Tính tỉ lệ lấp kiểu cũ để tương thích với ngưỡng lịch sử
+        legacy_filled = legacy_style_fill(region_clean)
+        legacy_filled_count = int((legacy_filled > 0).sum())
+        legacy_ratio = legacy_filled_count / float(max(1, sym_count))
+
+        # đo thêm: bao nhiêu pixel được thêm vào khi lấp lỗ
+        hole_pixels = max(0, filled_count - sym_count)
+        hole_area_ratio = float(hole_pixels) / float(max(1, filled_count))
+
+        # Cấu trúc contour: đếm lỗ trên mặt nạ đã làm sạch
+        cnts, hierarchy = cv2.findContours(region_clean, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        hole_count = 0
+        if hierarchy is not None and hierarchy.size:
+            h = hierarchy.reshape(-1, 4)
+            # contour con (parent != -1) chỉ ra lỗ
+            hole_count = int((h[:, 3] != -1).sum())
+
+        # Quy tắc heuristic (cải tiến): xem solidity và các ngưỡng nhẹ
+        w = x2 - x1
+        u = get_unit_size(int((x1 + x2) / 2), int((y1 + y2) / 2))
+
+        if w > u * nhc.NOTEHEAD_SIZE_RATIO * max_whole_note_width_factor:
+            note.force_set_label(NoteType.WHOLE)
         else:
-            solid_box.append(box)
+            # Quy tắc rỗng mềm hơn: chấp nhận filled_ratio hơi thấp hơn khi
+            # topology lỗ hoặc solidity thấp gợi ý rỗng.
+            solidity = getattr(note, 'solidity', 0.0)
 
-    # Assign notes with extracted infromation
-    logger.info("Instanitiating notes")
-    solid_notes = gen_notes(solid_box, symbols)  # type: ignore
-    hollow_notes = gen_notes(hollow_box, symbols)  # type: ignore
+            # Tóm tắt heuristic:
+            # - hole_count (từ hierarchy contour) là bằng chứng mạnh
+            # - hole_area_ratio (pixel thêm bởi fill) bắt các vòng mỏng
+            # - legacy_ratio hữu ích ngay cả khi hole_count==0
+            # - filled_ratio đơn lẻ yếu hơn vì cọng và nhiễu ảnh hưởng
 
-    logger.debug("Setting temporary note type")
-    for idx in range(len(hollow_notes)):
-        hollow_notes[idx].label = NoteType.HALF_OR_WHOLE
+            is_hollow = False
 
-    logger.debug("Parsing whether stem is on the right")
-    notes = solid_notes + hollow_notes
-    parse_stem_info(notes)
+            # Topology trực tiếp: contour chỉ ra lỗ
+            if hole_count >= 1:
+                if legacy_ratio > hollow_filled_ratio_th * 0.95 or filled_ratio > hollow_filled_ratio_th * 0.95:
+                    is_hollow = True
+                elif hole_area_ratio > 0.04:
+                    is_hollow = True
+
+            # Nếu không có contour rõ ràng, dùng legacy inflation và hole area làm dự phòng
+            if not is_hollow:
+                if legacy_ratio > (hollow_filled_ratio_th + 0.15):
+                    is_hollow = True
+                elif hole_area_ratio > 0.06:
+                    is_hollow = True
+
+            # solidity thấp và filled_ratio vừa phải thiên về rỗng
+            if not is_hollow:
+                if solidity < 0.65 and filled_ratio > (hollow_filled_ratio_th - 0.15):
+                    is_hollow = True
+
+            if is_hollow:
+                note.force_set_label(NoteType.HALF_OR_WHOLE)
+            else:
+                note.force_set_label(NoteType.QUARTER)
 
     return notes
 
 
-def draw_notes(notes, ori_img):
-    img = ori_img.copy()
-    img = np.array(img)
+# ─────────────────────────────────────────────────────────────────────────────
+# Trực quan hoá
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def draw_notes(notes: list[NoteHead], ori_img: ndarray) -> ndarray:
+    """Vẽ hộp giới hạn và ký hiệu loại lên `ori_img`."""
+    img = np.array(ori_img, copy=True)
     for note in notes:
-        x1, y1, x2, y2 = note.bbox
-        x_offset = 0
-        y_offset = 0
-        cv2.rectangle(img, (x1+x_offset, y1+y_offset), (x2+x_offset, y2+y_offset), (0, 255, 0), 2)
+        x1, y1, x2, y2 = note.bbox  # type: ignore[misc]
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
         if note.label:
-            cv2.putText(img, note.label.name[0], (x2+2, y2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 1)
+            cv2.putText(img, note.label.name[0], (x2 + 2, y2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 1)
     return img
-
-
-if __name__ == "__main__":
-    f_name = "wind2"
-    f_name = "last"
-    #f_name = "tabi"
-
-    #temp_data(f_name)
-
-    # staffs, zones = st_extract()
-    # layers.register_layer('staffs', np.array(staffs))
-    # layers.register_layer('zones', np.array(zones))
-
-    staff = layers.get_layer('staff_pred')
-    symbols = layers.get_layer('symbols_pred')
-    stems = layers.get_layer('stems_rests_pred')
-    notehead = layers.get_layer('notehead_pred')
-    ori_img = layers.get_layer('original_image')
-
-    aa = np.ones(staff.shape + (3,)) * 255
-    idx = np.where(notehead+stems > 0)
-    aa[idx[0], idx[1]] = 0
-
-    notes = extract()
-    rr = draw_notes(notes, aa)

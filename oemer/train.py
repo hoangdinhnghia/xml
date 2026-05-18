@@ -10,7 +10,7 @@ import augly.image as imaugs
 
 from .build_label import build_label
 from .models.unet import semantic_segmentation, u_net
-from .constant_min import CHANNEL_NUM
+from .constant import SEGNET_CHANNEL_NUM as CHANNEL_NUM
 
 
 
