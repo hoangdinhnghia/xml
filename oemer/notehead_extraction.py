@@ -1,5 +1,19 @@
 from __future__ import annotations
 
+"""
+Module trích xuất và phân loại đầu nốt (notehead).
+
+Chịu trách nhiệm nhận các dự đoán `notehead_pred` từ tầng phân đoạn,
+tiền xử lý mặt nạ, phát hiện các blob ứng viên, tách các đầu nốt dính nhau,
+lọc theo đặc trưng hình học, gán đầu nốt về `Staff` tương ứng và phân loại sơ bộ
+(rỗng/đặc). Các hàm chính gồm `detect_noteheads`, `get_notehead_bbox`,
+`gen_notes`, `parse_stem_info` và `extract`.
+
+File này sử dụng các heuristic dựa trên `unit_size` của khuông để điều chỉnh
+tham số morphology, thresholds và kiểm tra kích thước; các giá trị mặc định
+được khai báo trong các tham số hàm và hằng số trong `oemer.constant`.
+"""
+
 import enum
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,6 +35,7 @@ from oemer.staffline_extraction import Staff
 from oemer.utils import find_closest_staffs, get_global_unit_size, get_unit_size
 
 logger = get_logger(__name__)
+from oemer.utils import C, _overlay, _rect, _text, _legend, _save
 
 nn_img: ndarray   # hình ảnh để trực quan gỡ lỗi, được điền trong hàm extract()
 
@@ -29,6 +44,12 @@ nn_img: ndarray   # hình ảnh để trực quan gỡ lỗi, được điền t
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NoteType(enum.Enum):
+    """Kiểu trường độ sơ bộ của notehead.
+
+    Giá trị này là nhãn sơ bộ dùng trong pipeline trước khi có phân tích
+    cọng/beam đầy đủ. `HALF_OR_WHOLE` là trạng thái trung gian cho các đầu
+    nốt rỗng cần phân giải thêm (ví dụ tách HALF hay WHOLE sau khi xem cọng).
+    """
     WHOLE         = 0
     HALF          = 1
     QUARTER       = 2
@@ -67,7 +88,7 @@ class NoteHead:
     invalid:        bool                  = False
     id:             int | None            = None
     note_group_id:  int | None            = None
-    sfn:            Any                   = None   # sharp / flat / natural
+    sfn:            Any                   = None   # dau hoa bat thuong (thang/giang/hoan)
     solidity:       float                 = 0.0    # MỚI: solidity từ bao lồi
 
     _label: NoteType | None = field(default=None, repr=False)
@@ -179,13 +200,13 @@ def legacy_style_fill(region: ndarray) -> ndarray:
     for yi in range(h):
         cur = 0
         cand = []
-        # move to first foreground
+        # Di chuyen den diem tien canh dau tien
         while cur < w and tar[yi, cur] == 0:
             cur += 1
-        # move to next background after foreground
+        # Di chuyen den nen tiep theo sau doan tien canh
         while cur < w and tar[yi, cur] > 0:
             cur += 1
-        # collect background candidate pixels until next foreground
+        # Thu thap cac pixel nen ung vien den khi gap tien canh tiep theo
         while cur < w and tar[yi, cur] == 0:
             cand.append(cur)
             cur += 1
@@ -209,6 +230,60 @@ def legacy_style_fill(region: ndarray) -> ndarray:
                 tar[yi, xi] = 1
 
     return tar
+
+
+def save_noteheads_viz(out_dir: str) -> None:
+    """Luu anh truc quan hoa phat hien notehead vao thu muc out_dir."""
+    try:
+        img = layers.get_layer('original_image')
+        if img is None:
+            return
+        canvas = img.copy()
+    except Exception:
+        return
+
+    note_mask = layers.get_layer('notehead_pred')
+    notes = layers.get_layer('notes')
+    if note_mask is not None:
+        canvas = _overlay(canvas, note_mask, C['note_half'], alpha=0.20)
+
+    label_color_map = {
+        'WHOLE': C['note_whole'],
+        'HALF': C['note_half'],
+        'HALF_OR_WHOLE': C['note_half'],
+        'QUARTER': C['note_quarter'],
+    }
+
+    if notes is None:
+        _save(out_dir, 'step2_noteheads', canvas)
+        return
+
+    for note in notes:
+        if note.bbox is None:
+            continue
+        x1, y1, x2, y2 = note.bbox
+        lbl = note._label.name if note._label is not None else '?'
+        col = label_color_map.get(lbl, C['note_other'])
+        nid = note.id if note.id is not None else '?'
+        _rect(canvas, note.bbox, col, thickness=1)
+        stem_ch = '^' if note.stem_up is True else ('v' if note.stem_up is False else '?')
+        tag1 = f"#{nid} {lbl[:3]} {stem_ch}"
+        _text(canvas, tag1, (x1, max(y1 - 3, 8)), col, scale=0.32)
+        pos = note.staff_line_pos if note.staff_line_pos is not None else '?'
+        sol = f"{note.solidity:.2f}" if hasattr(note, 'solidity') else '-'
+        tag2 = f"pos={pos} sol={sol}"
+        _text(canvas, tag2, (x1, min(y2 + 10, canvas.shape[0] - 4)), col, scale=0.30)
+
+    legend_items = [
+        ("WHOLE", C['note_whole']),
+        ("HALF / H_OR_W", C['note_half']),
+        ("QUARTER", C['note_quarter']),
+        ("Khac / khong ro", C['note_other']),
+        ("^ : stem huong len", C['stem_up']),
+        ("v : stem huong xuong", C['stem_down']),
+    ]
+    _legend(canvas, legend_items, x0=6, y0=18, dy=16)
+    _save(out_dir, 'step2_noteheads', canvas)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -452,7 +527,7 @@ def _staff_line_position(cen_y: float, staff: Staff) -> int:
 
 
 def gen_notes(bboxes: list[BBox], symbols: ndarray) -> list[NoteHead]:
-    """Khởi tạo các đối tượng NoteHead với bbox, điểm, metadata khuông và solidity."""
+    """Khoi tao cac doi tuong NoteHead voi bbox, diem, thong tin khuong va solidity."""
     notes: list[NoteHead] = []
     for bbox in bboxes:
         note = NoteHead(bbox=bbox)
@@ -496,8 +571,8 @@ def parse_stem_info(notes: list[NoteHead]) -> None:
     """
     Xác định cọng nằm về phải hay trái so với mỗi notehead.
 
-    Dùng `scipy.ndimage.center_of_mass` trên bản đồ cọng đã gán nhãn:
-    một lần gọi ở cấp C cho mỗi nhãn thay vì tạo mảng toạ độ ở Python.
+    Dung scipy.ndimage.center_of_mass tren ban do cong da gan nhan:
+    mot lan goi o cap C cho moi nhan thay vi tao mang toa do o Python.
     """
     stems  = layers.get_layer('stems_rests_pred')
     kernel = np.ones((3, 2), np.uint8)
@@ -559,10 +634,10 @@ def extract(
 
     notes = gen_notes(bboxes, symbols)
 
-    # Thông tin cọng (điền trường stem_right)
+    # Thong tin cong (dien truong stem_right)
     parse_stem_info(notes)
 
-    # Lọc hậu xử lý: loại phát hiện nhiễu có mật độ/solidity thấp
+    # Loc hau xu ly: loai phat hien nhieu co mat do/solidity thap
     filtered: list[NoteHead] = []
     for note in notes:
         if note.bbox is None:
@@ -571,22 +646,22 @@ def extract(
         region = symbols[y1:y2, x1:x2].astype(np.uint8)
         area = max(1, (x2 - x1) * (y2 - y1))
         density = float((region > 0).sum()) / area
-        # giữ nếu mật độ đủ cao hoặc solidity cho thấy hình dạng phù hợp
+        # Giu lai neu mat do du cao hoac solidity cho thay hinh dang phu hop
         if density >= 0.5 or note.solidity >= 0.6:
             filtered.append(note)
         else:
-            # khả năng nhỏ là note rỗng; đánh lại bằng cách lấp kiểu cũ
+            # Truong hop kha nang la note rong: thu danh gia lai bang lap kieu cu
             lfilled = legacy_style_fill(region)
             lratio = float((lfilled > 0).sum()) / max(1, (region > 0).sum())
             if lratio > hollow_filled_ratio_th:
                 filtered.append(note)
             else:
-                # loại bỏ phát hiện độ tin cậy thấp
+                # Loai bo phat hien do tin cay thap
                 continue
     notes = filtered
 
-    # Quyết định rỗng vs đặc dùng quy tắc tổ hợp không phụ thuộc triển khai cũ.
-    # Dùng tỉ lệ filled/unfilled và topology (đếm contour/hole) để tăng bền vững.
+    # Quyet dinh rong hay dac bang tap quy tac ket hop, khong phu thuoc trien khai cu.
+    # Dung ti le filled/unfilled va topology (dem contour/hole) de tang do ben vung.
     for note in notes:
         if note.bbox is None:
             continue
@@ -597,15 +672,15 @@ def extract(
         if sym_count == 0:
             continue
 
-        # Loại bỏ cọng trước khi phân tích topology để tránh cọng nối hoặc lấp lỗ
+        # Loai bo cong truoc khi phan tich topology de tranh cong noi hoac lap lo
         stems = layers.get_layer('stems_rests_pred')
         st_crop = stems[y1:y2, x1:x2].astype(np.uint8)
-        # Phóng to cọng một chút để đảm bảo loại bỏ
+        # Phong to cong mot chut de dam bao loai bo
         ker = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         st_dil = cv2.dilate(st_crop, ker, iterations=1)
         region_nostem = np.where(st_dil > 0, 0, region)
 
-        # Làm sạch các đốm nhỏ trước khi phân tích contour
+        # Lam sach cac dom nho truoc khi phan tich contour
         clean_ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         region_clean = cv2.morphologyEx(region_nostem, cv2.MORPH_OPEN, clean_ker)
 
@@ -613,7 +688,7 @@ def extract(
         filled_count = int((filled > 0).sum())
         filled_ratio = filled_count / float(max(1, sym_count))
 
-        # Tính tỉ lệ lấp kiểu cũ để tương thích với ngưỡng lịch sử
+        # Tinh ti le lap kieu cu de tuong thich voi nguong lich su
         legacy_filled = legacy_style_fill(region_clean)
         legacy_filled_count = int((legacy_filled > 0).sum())
         legacy_ratio = legacy_filled_count / float(max(1, sym_count))
@@ -622,26 +697,26 @@ def extract(
         hole_pixels = max(0, filled_count - sym_count)
         hole_area_ratio = float(hole_pixels) / float(max(1, filled_count))
 
-        # Cấu trúc contour: đếm lỗ trên mặt nạ đã làm sạch
+        # Cau truc contour: dem lo tren mat na da lam sach
         cnts, hierarchy = cv2.findContours(region_clean, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         hole_count = 0
         if hierarchy is not None and hierarchy.size:
             h = hierarchy.reshape(-1, 4)
-            # contour con (parent != -1) chỉ ra lỗ
+            # Contour con (parent != -1) cho thay co lo
             hole_count = int((h[:, 3] != -1).sum())
 
-        # Quy tắc heuristic (cải tiến): xem solidity và các ngưỡng nhẹ
+            # Quy tac heuristic cai tien: ket hop solidity va cac nguong mem
         w = x2 - x1
         u = get_unit_size(int((x1 + x2) / 2), int((y1 + y2) / 2))
 
         if w > u * nhc.NOTEHEAD_SIZE_RATIO * max_whole_note_width_factor:
             note.force_set_label(NoteType.WHOLE)
         else:
-            # Quy tắc rỗng mềm hơn: chấp nhận filled_ratio hơi thấp hơn khi
-            # topology lỗ hoặc solidity thấp gợi ý rỗng.
+            # Quy tac note rong mem hon: chap nhan filled_ratio thap hon mot chut
+            # khi topology lo hoac solidity thap goi y rong.
             solidity = getattr(note, 'solidity', 0.0)
 
-            # Tóm tắt heuristic:
+            # Tom tat quy tac:
             # - hole_count (từ hierarchy contour) là bằng chứng mạnh
             # - hole_area_ratio (pixel thêm bởi fill) bắt các vòng mỏng
             # - legacy_ratio hữu ích ngay cả khi hole_count==0
@@ -649,21 +724,21 @@ def extract(
 
             is_hollow = False
 
-            # Topology trực tiếp: contour chỉ ra lỗ
+            # Topology truc tiep: contour cho thay lo
             if hole_count >= 1:
                 if legacy_ratio > hollow_filled_ratio_th * 0.95 or filled_ratio > hollow_filled_ratio_th * 0.95:
                     is_hollow = True
                 elif hole_area_ratio > 0.04:
                     is_hollow = True
 
-            # Nếu không có contour rõ ràng, dùng legacy inflation và hole area làm dự phòng
+            # Neu khong co contour ro rang, dung ti le phinh theo cach cu va hole area de du phong
             if not is_hollow:
                 if legacy_ratio > (hollow_filled_ratio_th + 0.15):
                     is_hollow = True
                 elif hole_area_ratio > 0.06:
                     is_hollow = True
 
-            # solidity thấp và filled_ratio vừa phải thiên về rỗng
+            # solidity thap va filled_ratio vua phai thuong nghieng ve note rong
             if not is_hollow:
                 if solidity < 0.65 and filled_ratio > (hollow_filled_ratio_th - 0.15):
                     is_hollow = True
@@ -682,7 +757,7 @@ def extract(
 
 
 def draw_notes(notes: list[NoteHead], ori_img: ndarray) -> ndarray:
-    """Vẽ hộp giới hạn và ký hiệu loại lên `ori_img`."""
+    """Ve hop gioi han va ky hieu loai len anh ori_img."""
     img = np.array(ori_img, copy=True)
     for note in notes:
         x1, y1, x2, y2 = note.bbox  # type: ignore[misc]

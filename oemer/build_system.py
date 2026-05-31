@@ -17,10 +17,17 @@ from oemer.notehead_extraction import NoteHead, NoteType
 from oemer.utils import get_global_unit_size, get_total_track_nums
 from oemer.utils import get_logger
 
+"""Xây dựng cấu trúc bản nhạc (MusicXML) từ các ký hiệu đã nhận dạng.
+
+Mô-đun này gom các lớp ký hiệu (nốt, khóa, dấu hóa, dấu lặng, vạch nhịp)
+thành các ô nhịp (measure), cân bằng trường độ giữa các bè và cuối cùng xuất
+ra chuẩn MusicXML để có thể mở bằng phần mềm soạn nhạc.
+"""
+
 
 logger = get_logger(__name__)
 
-DIVISION_PER_QUATER = 16  # Equal to length of 64th note.
+DIVISION_PER_QUATER = 16  # Đơn vị chia nhịp; 1/16 đen tương đương nốt 1/64.
 
 G_CLEF_POS_TO_PITCH = ['D', 'E', 'F', 'G', 'A', 'B', 'C']
 F_CLEF_POS_TO_PITCH = ['F', 'G', 'A', 'B', 'C', 'D', 'E']
@@ -53,22 +60,28 @@ DURATION_TO_REST_TYPE = {v: k for k, v in REST_TYPE_TO_DURATION.items()}
 
 
 class Key(enum.Enum):
-    C_MAJOR = 0  # Same as A-minor
-    G_MAJOR = 1  # Same as E-minor
-    D_MAJOR = 2  # Same as B-minor
-    A_MAJOR = 3  # Same as F#-minor
-    E_MAJOR = 4  # Same as C#-minor
-    B_MAJOR = 5  # Same as G#-minor
-    F_SHARP_MAJOR = 6  # Same as D#-minor
-    F_MAJOR = -1  # Same as D-minor
-    B_FLAT_MAJOR = -2  # Same as G-minor
-    E_FLAT_MAJOR = -3  # Same as C-minor
-    A_FLAT_MAJOR = -4  # Same as F-minor
-    D_FLAT_MAJOR = -5  # Same as Bb-minor
-    G_FLAT_MAJOR = -6  # Same as Eb-minor
+    C_MAJOR = 0  # C trưởng (cùng hóa biểu với A thứ)
+    G_MAJOR = 1  # G trưởng (cùng hóa biểu với E thứ)
+    D_MAJOR = 2  # D trưởng (cùng hóa biểu với B thứ)
+    A_MAJOR = 3  # A trưởng (cùng hóa biểu với F# thứ)
+    E_MAJOR = 4  # E trưởng (cùng hóa biểu với C# thứ)
+    B_MAJOR = 5  # B trưởng (cùng hóa biểu với G# thứ)
+    F_SHARP_MAJOR = 6  # F# trưởng (cùng hóa biểu với D# thứ)
+    F_MAJOR = -1  # F trưởng (cùng hóa biểu với D thứ)
+    B_FLAT_MAJOR = -2  # Bb trưởng (cùng hóa biểu với G thứ)
+    E_FLAT_MAJOR = -3  # Eb trưởng (cùng hóa biểu với C thứ)
+    A_FLAT_MAJOR = -4  # Ab trưởng (cùng hóa biểu với F thứ)
+    D_FLAT_MAJOR = -5  # Db trưởng (cùng hóa biểu với Bb thứ)
+    G_FLAT_MAJOR = -6  # Gb trưởng (cùng hóa biểu với Eb thứ)
 
 
 class Voice:
+    """Biểu diễn một giọng nhịp trong cùng một cụm notehead.
+
+    Một `Voice` có thể chứa một hoặc nhiều nốt (hợp âm), giữ thông tin nhãn
+    trường độ, có chấm dôi hay không, hướng thân nốt và track (khuông).
+    """
+
     def __init__(self) -> None:
         self.id: Union[int, None] = None
         self.note_ids: List[int] = []
@@ -83,9 +96,17 @@ class Voice:
         self.rhythm_name: Union[str, None] = None
 
     def init(self) -> None:
+        """Khởi tạo nhãn trường độ và trạng thái chấm dôi cho giọng.
+
+        Thuật toán:
+        1) Lấy nhãn nốt xuất hiện nhiều nhất trong `note_ids` làm nhãn chuẩn.
+        2) Bỏ phiếu đa số cho thuộc tính `has_dot`.
+        3) Đồng bộ lại tất cả nốt trong giọng theo nhãn/chấm đã quyết định.
+        4) Quy đổi sang tên nhịp (`rhythm_name`) và độ dài `duration`.
+        """
         notes = layers.get_layer('notes')
 
-        # Determine the label
+        # Xác định nhãn trường độ đại diện theo nguyên tắc đa số.
         labels = [notes[nid].label for nid in self.note_ids]
         ll_count = {ll: 0 for ll in set(labels)}
         for ll in labels:
@@ -93,13 +114,13 @@ class Voice:
         ll_count = sorted(ll_count.items(), key=lambda it: it[1], reverse=True)  # type: ignore
         self.label = ll_count[0][0]  # type: ignore
 
-        # Determine the dots
+        # Xác định có chấm dôi hay không theo bỏ phiếu đa số.
         dots = [notes[nid].has_dot for nid in self.note_ids]
         t_count = sum(dots)
         f_count = len(dots) - t_count
         self.has_dot = True if t_count > f_count else False
 
-        # Update the label of notes
+        # Đồng bộ nhãn/chấm dôi ngược lại cho toàn bộ note trong cùng voice.
         for nid in self.note_ids:
             if notes[nid].label != self.label:
                 notes[nid].force_set_label(self.label)
@@ -117,6 +138,15 @@ class Voice:
 
 
 class Measure:
+    """Biểu diễn một ô nhịp và logic căn chỉnh nhịp giữa các track.
+
+    Mỗi measure chứa danh sách ký hiệu đã sắp theo trục X. Khi cần, measure sẽ:
+    - nhận diện hóa biểu mở đầu,
+    - suy luận khóa nhạc theo track,
+    - gom ký hiệu vào các time slot,
+    - cân bằng trường độ giữa các track bằng kéo dài ký hiệu hoặc chèn dấu lặng.
+    """
+
     def __init__(self) -> None:
         self.symbols: List[Any] = []  # List of symbols
         self.double_barline: Union[bool, None] = None
@@ -133,6 +163,7 @@ class Measure:
         self.slot_duras: np.ndarray = None  # type: ignore
 
     def add_symbols(self, symbols: Union[List[Union[Clef, Rest, Sfn]], List[Voice]]) -> None:
+        """Thêm ký hiệu vào measure và cập nhật các bộ đệm theo loại."""
         self.symbols.extend(symbols)
         self.symbols = sorted(self.symbols, key=lambda s: s.x_center)
         for sym in symbols:
@@ -153,12 +184,21 @@ class Measure:
         self.rests = sorted(self.rests, key=lambda s: s.x_center)
 
     def has_key(self) -> bool:
+        """Kiểm tra measure hiện tại có chứa cụm hóa biểu đầu khuông hay không."""
         total_tracks = get_total_track_nums()
         start_idx = total_tracks if self.at_beginning else 0
         syms =  self.symbols[start_idx:start_idx+total_tracks]
         return all(isinstance(sym, Sfn) for sym in syms)
 
     def get_key(self) -> Key:
+        """Suy luận hóa biểu của measure từ chuỗi dấu hóa đầu ô nhịp.
+
+        Ý tưởng chính:
+        - Chỉ xét cụm `Sfn` ở đầu measure (sau clef nếu ở đầu hệ).
+        - Đếm số lượng dấu hóa theo từng track.
+        - Ưu tiên tính nhất quán giữa các track; nếu nhiễu thì dùng bỏ phiếu.
+        - Đánh dấu `is_key=True` cho các `Sfn` thuộc hóa biểu.
+        """
         if len(self.sfns) == 0:
             return Key(0)
 
@@ -175,63 +215,63 @@ class Measure:
         else:
             return Key(0)
 
-        # Prepare data
-        sfns_cands = []  # Candidates of key
+        # Chuẩn bị danh sách ứng viên dấu hóa thuộc hóa biểu.
+        sfns_cands = []
         for i in range(start_idx, end_idx):
             sym = self.symbols[i]
             if not isinstance(sym, Sfn):
                 break
             sfns_cands.append(sym)
 
-        # Count occurance
+        # Đếm số lượng dấu hóa theo từng track.
         sfn_counts = [0 for _ in range(track_nums)]
         for sfn in sfns_cands:
             sfn_counts[sfn.track] += 1  # type: ignore
 
-        # Check validity
-        all_same = all(ss.label==sfns_cands[0].label for ss in sfns_cands)  # All tracks have the same label.
-        all_equal = all(cc==sfn_counts[0] for cc in sfn_counts)  # All tracks have the same number of sfns.
+        # Kiểm tra tính hợp lệ: cùng loại dấu và cùng số lượng giữa các track.
+        all_same = all(ss.label==sfns_cands[0].label for ss in sfns_cands)
+        all_equal = all(cc==sfn_counts[0] for cc in sfn_counts)
 
         if not all_equal:
             logger.warning("The number of key symbols are not all the same for every track!")
 
         sfn_label = sfns_cands[0].label
         if not all_same:
-            # Count the most occurance.
+            # Trường hợp nhiễu: bỏ phiếu đa số cho loại dấu.
             counter = {SfnType.FLAT: 0, SfnType.SHARP: 0, SfnType.NATURAL: 0}
             for sfn in sfns_cands:
                 counter[sfn.label] += 1
             counter = sorted(counter.items(), key=lambda s: s[1], reverse=True)  # type: ignore
             if counter[0][0] == SfnType.NATURAL:  # type: ignore
-                # Swap the first and second candidates when the first sfn type is natural.
+                # Nếu tự nhiên đứng đầu, đổi vị trí để ưu tiên nhãn rõ hơn.
                 counter[0], counter[1] = counter[1], counter[0]  # type: ignore
 
             if counter[0][0] == SfnType.FLAT:  # type: ignore
-                # Flat and sharp/natural is assumed will not being confused by the model.
+                # Mô hình thường ít nhầm phẳng với các loại còn lại.
                 sfn_label = SfnType.FLAT
             elif counter[0][0] == SfnType.SHARP:  # type: ignore
                 if counter[1][0] == SfnType.FLAT:  # type: ignore
                     sfn_label = SfnType.SHARP
                 elif counter[0][1] > counter[1][1]:  # type: ignore
-                    # Sharp and natural are the most error-prone for prediction.
+                    # Cặp thăng/tự nhiên là cặp dễ nhầm nhất.
                     sfn_label = SfnType.SHARP
                 else:
-                    # The most special case that number of sharp and natural are the same,
-                    # which means the key indeed contains natural.
-                    # TODO: should allow natural key
+                    # Trường hợp hòa: hiện vẫn thiên về thăng.
+                    # TODO: hỗ trợ đầy đủ hóa biểu có dấu tự nhiên.
                     sfn_label = SfnType.SHARP
 
         count = round(sum(sfn_counts) / track_nums)
         if sfn_label == SfnType.FLAT:
             count *= -1
 
-        # Update the sfn state
+        # Cập nhật trạng thái để phân biệt dấu hóa biểu và dấu hóa ngẫu nhiên.
         for sfn in sfns_cands:
             sfn.is_key = True
 
         return Key(count)
 
     def get_track_clef(self) -> List[Clef]:
+        """Lấy khóa nhạc hiện hành cho từng track trong measure."""
         track_nums = get_total_track_nums()
         if self.at_beginning or self.double_barline:
             clefs = []
@@ -249,6 +289,13 @@ class Measure:
         return [None for _ in range(track_nums)]  # type: ignore
 
     def align_symbols(self) -> Optional[Any]:
+        """Căn chỉnh ký hiệu theo time slot và cân bằng trường độ giữa track.
+
+        Với 2 track (ví dụ piano tay phải/tay trái), hàm sẽ phát hiện lệch nhịp
+        tích lũy và xử lý bằng một trong hai cách:
+        - kéo dài ký hiệu đang có (ưu tiên), hoặc
+        - chèn dấu lặng có trường độ phù hợp.
+        """
         track_nums = get_total_track_nums()
         unit_size = get_global_unit_size()
         time_slots: List[List[Any]] = []
@@ -275,7 +322,7 @@ class Measure:
                     corr_sidx.append(idx)
                     last_x = sym.x_center
 
-        # Collect necessary informations for determining rhythm mismatch.
+        # Thu thập dữ liệu tối thiểu để phát hiện lệch trường độ giữa các track.
         multi_track_idx = []
         track_duras = np.zeros((len(time_slots), track_nums), dtype=np.uint16)
         for idx, slot in enumerate(time_slots):
@@ -291,14 +338,14 @@ class Measure:
                 du = min(durations) if durations else 0
                 track_duras[idx, track] = du
 
-        # Decide whether to keep processing
+        # Nếu chỉ có 1 track thì không cần cân bằng chéo track.
         if track_nums == 1:
             self.time_slots = time_slots
             self.slot_duras = track_duras
             return None
         assert track_nums == 2, track_nums
 
-        # Start adjusting rhythms
+        # Bắt đầu cân bằng nhịp cho trường hợp 2 track.
         diff = 0
         lead_track = None
         add_idx = None
@@ -310,7 +357,7 @@ class Measure:
         def modify(add_idx, diff, lead_track, added):
             pos_dura = track_duras[add_idx, 1-lead_track]
             if pos_dura != 0:
-                # Extend the length of the original symbol
+                # Kéo dài ký hiệu sẵn có ở track còn lại.
                 for sym in time_slots[add_idx]:
                     if sym.track == 1-lead_track:
                         ori_label = sym.label
@@ -320,7 +367,7 @@ class Measure:
                                     f" / After: {sym.label}, Dot: {sym.has_dot}")
                 new_track_duras[add_idx, 1-lead_track] = diff+pos_dura
             else:
-                # Add rest to balance the rhythm
+                # Không có ký hiệu để kéo dài: chèn rest để bù nhịp.
                 rest = get_rest(diff)
                 rest.track = 1 - lead_track
                 rest.group = self.group
@@ -396,6 +443,13 @@ class Measure:
 
 
 class Action:
+    """Lớp hành động trừu tượng để phát sinh nút XML theo ngữ cảnh hiện tại.
+
+    `ctx` lưu trạng thái toàn cục khi duyệt bản nhạc:
+    - hóa biểu hiện hành,
+    - khóa theo từng track,
+    - trạng thái dấu hóa (thăng/giáng/tự nhiên) theo tên nốt.
+    """
 
     class Context:
         key: Union[Key, None] = None
@@ -412,6 +466,7 @@ class Action:
 
     @classmethod
     def init_sfn_state(cls) -> None:
+        """Khởi tạo bảng trạng thái dấu hóa theo hóa biểu hiện hành."""
         cls.ctx.sfn_state = {chr(ord('A')+i):None for i in range(7)}  # type: ignore
         if cls.ctx.key and cls.ctx.key.value > 0:
             for sfn_name in SHARP_KEY_ORDER[:cls.ctx.key.value]:
@@ -422,12 +477,14 @@ class Action:
 
     @classmethod
     def clear(cls) -> None:
+        """Xóa sạch ngữ cảnh để bắt đầu một lượt dựng XML mới."""
         cls.ctx.key = None
         cls.ctx.clefs = []
         cls.ctx.sfn_state = {chr(ord('A')+i):None for i in range(7)}  # type: ignore
 
 
 class KeyChange(Action):
+    """Hành động chèn thay đổi hóa biểu vào MusicXML."""
     def __init__(self, key, **kwargs):
         super().__init__(**kwargs)
         self.key = key
@@ -442,6 +499,7 @@ class KeyChange(Action):
 
 
 class ClefChange(Action):
+    """Hành động chèn thay đổi khóa nhạc theo track."""
     def __init__(self, clef, **kwargs):
         super().__init__(**kwargs)
         self.clef = clef
@@ -455,6 +513,11 @@ class ClefChange(Action):
 
 
 class AddNote(Action):
+    """Hành động thêm nốt/hợp âm vào measure hiện tại.
+
+    Khi thêm nốt, hàm đồng bộ dấu hóa theo ngữ cảnh hiện hành để bảo toàn
+    quy tắc hiệu lực dấu hóa trong cùng ô nhịp.
+    """
     def __init__(self, note: NoteHead, chord=False, voice=1, **kwargs):
         super().__init__(**kwargs)
         self.note = note
@@ -476,6 +539,7 @@ class AddNote(Action):
 
 
 class AddRest(Action):
+    """Hành động thêm dấu lặng vào measure hiện tại."""
     def __init__(self, rest: Rest, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.rest = rest
@@ -488,6 +552,7 @@ class AddRest(Action):
 
 
 class AddBackup(Action):
+    """Hành động lùi con trỏ thời gian (MusicXML `<backup>`)."""
     def __init__(self, dura, **kwargs):
         super().__init__(**kwargs)
         self.dura = dura
@@ -500,6 +565,7 @@ class AddBackup(Action):
 
 
 class AddForward(Action):
+    """Hành động tiến con trỏ thời gian (MusicXML `<forward>`)."""
     def __init__(self, dura: int, **kwargs):
         super().__init__(**kwargs)
         self.dura = dura
@@ -512,6 +578,7 @@ class AddForward(Action):
 
 
 class AddMeasure(Action):
+    """Hành động mở một measure mới, có thể kèm ngắt hệ."""
     def __init__(self, measure: Measure, add_break: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.measure = measure
@@ -528,6 +595,11 @@ class AddMeasure(Action):
 
 
 class AddInit(Action):
+    """Hành động tạo measure đầu tiên kèm phần thuộc tính khởi tạo.
+
+    Bao gồm divisions, hóa biểu đầu, số khuông (`staves`) và clef cho từng
+    track để phần còn lại của bản nhạc kế thừa đúng ngữ cảnh.
+    """
     def __init__(self, measure: Measure, **kwargs):
         super().__init__(**kwargs)
         assert measure.at_beginning
@@ -560,13 +632,23 @@ class AddInit(Action):
 
 
 class MusicXMLBuilder:
+    """Bộ dựng MusicXML từ các ký hiệu đã phân tích ở tầng trước.
+
+    Quy trình tổng quát:
+    1) Gom ký hiệu theo group và cắt thành các measure.
+    2) Căn nhịp nội bộ từng measure.
+    3) Sinh chuỗi `Action` theo thứ tự thời gian.
+    4) Thực thi action để tạo cây XML hoàn chỉnh.
+    """
+
     def __init__(self, title: Optional[str] = None) -> None:
         self.measures: dict[int, List[Measure]] = {}
         self.actions: List[Action] = []
         self.title: str = title  # type: ignore
 
     def build(self) -> None:
-        # Fetch parameters
+        """Xây danh sách action từ dữ liệu ký hiệu đã nhận dạng."""
+        # Lấy các lớp dữ liệu trung gian cần thiết.
         notes = layers.get_layer('notes')
 
         voices = get_voices()
@@ -611,7 +693,7 @@ class MusicXMLBuilder:
                                 self.actions.append(KeyChange(key))
                                 cur_key = key
                     else:
-                        # Adjust beat position first
+                        # Ước lượng vị trí nhịp hiện tại trước khi phát action.
                         tidx, min_duras = measure.get_time_slot_dura(sym.x_center)
                         min_dura = min_duras[track]
                         dura = get_duration(sym)
@@ -623,31 +705,31 @@ class MusicXMLBuilder:
                             if diff > 0 and diff != last_dura:
                                 self.actions.append(AddBackup(int(diff)))
 
-                        # Update some inner state according to voice number.
+                        # Cập nhật trạng thái theo voice 1/voice 2 trên cùng track.
                         if (dura == min_dura) and (not min_dura_added[track]):
-                            # It's the first voice.
+                            # Voice thứ nhất.
                             total_track_duras[track] += min_dura
                             min_dura_added[track] = True
                             voice_one = True
                         else:
-                            # The second voice.
+                            # Voice thứ hai.
                             voice_one = False
 
-                        # Add the symbol
+                        # Đẩy action tương ứng vào hàng đợi sinh MusicXML.
                         if isinstance(sym, Rest):
                             self.actions.append(AddRest(sym))
                             last_pos = total_track_duras[track]
                             last_dura = dura
                             last_tidx = tidx
                         elif isinstance(sym, Voice):
-                            # # Adjust invalid sfn state of ntoes.
+                            # # Hiệu chỉnh dấu hóa bất thường của nốt (nếu cần).
                             # for nid in sym.note_ids:
                             #     if notes[nid].sfn == SfnType.FLAT and cur_key.value > 0:
                             #         notes[nid].sfn = SfnType.NATURAL
                             #     elif notes[nid].sfn == SfnType.SHARP and cur_key.value < 0:
                             #         notes[nid].sfn = SfnType.NATURAL
 
-                            # Add action to the queue
+                            # Đưa note/chord vào hàng đợi.
                             if sym.duration == min_dura and voice_one:
                                 self.actions.append(AddNote(notes[sym.note_ids[0]]))
                                 for nid in sym.note_ids[1:]:
@@ -656,14 +738,14 @@ class MusicXMLBuilder:
                                 last_dura = dura
                                 last_tidx = tidx
                             else:
-                                # Second voice in the track. Need special process.
+                                # Voice 2 cần xử lý bù/trừ vị trí thời gian riêng.
                                 self.actions.append(AddNote(notes[sym.note_ids[0]], voice=2))
                                 for nid in sym.note_ids[1:]:
                                     self.actions.append(AddNote(notes[nid], chord=True, voice=2))
                                 cur_pos = total_track_duras[track] + sym.duration
                                 if min_dura_added[track]:
-                                    # Check whether the min dura has been added or not.
-                                    # If yes, need to backup extra duration.
+                                    # Nếu đã cộng `min_dura`, cần trừ phần này để
+                                    # so vị trí thời gian thực của voice 2.
                                     cur_pos -= min_dura
                                 diff = last_pos - cur_pos
                                 if diff > 0:
@@ -672,7 +754,8 @@ class MusicXMLBuilder:
                                     self.actions.append(AddBackup(int(-diff)))
 
     def gen_measures(self, group_container: Dict[int, List[Any]]) -> None:
-        num = 1  # Measure count starts from 1 for MusicXML
+        """Tách chuỗi ký hiệu theo vạch nhịp để tạo danh sách measure."""
+        num = 1  # MusicXML đánh số measure từ 1.
         for grp, insts in group_container.items():
             self.measures[grp] = []
             buffer: List[Any] = []
@@ -681,7 +764,7 @@ class MusicXMLBuilder:
             for inst in insts:
                 if isinstance(inst, Barline):
                     if len(buffer) == 0:
-                        # Double barline
+                        # Hai vạch nhịp liền nhau.
                         double_barline = True
                     else:
                         mm = gen_measure(buffer, grp, num, at_beginning, double_barline)
@@ -695,11 +778,12 @@ class MusicXMLBuilder:
                 buffer.append(inst)
 
             if buffer:
-                # Clear out buffer
+                # Xử lý phần đệm còn lại ở cuối group.
                 mm = gen_measure(buffer, grp, num, at_beginning, double_barline)
                 self.measures[grp].append(mm)
 
     def to_musicxml(self, tempo: int = 90) -> bytes:
+        """Thực thi action queue và trả về bytes MusicXML hoàn chỉnh."""
         score = Element('score-partwise', attrib={'version': '4.0'})
         work = build_work(self.title)
         iden = build_identity()
@@ -715,7 +799,7 @@ class MusicXMLBuilder:
             else:
                 action.perform(parent_elem=measure)
 
-        # Construct DOCTYPE header
+        # Bổ sung DOCTYPE theo chuẩn MusicXML partwise.
         mxl_str = pretty_xml(score)
         doctype = b''\
             b'<!DOCTYPE score-partwise PUBLIC' \
@@ -726,7 +810,7 @@ class MusicXMLBuilder:
         mxl_list[0] += b'?>\n'
         mxl_str = b"".join(mxl_list)
 
-        # Work around for merging the init and the first measure.
+        # Hợp nhất đoạn mở đầu với measure đầu để tránh dư khối XML.
         mxl_str = re.sub(rb'\s+</measure>\n\s+<measure number="1">\n\s+<print.+/>', b'', mxl_str)
         return mxl_str
 
@@ -738,19 +822,24 @@ def gen_measure(
     at_beginning: bool = False, 
     double_barline: bool = False
 ) -> Measure:
+    """Tạo một đối tượng `Measure` và khởi tạo các trạng thái phụ trợ."""
     mm = Measure()
     mm.add_symbols(buffer)
     mm.double_barline = double_barline
     mm.number = num
     mm.at_beginning = at_beginning
     mm.group = grp
-    mm.get_key()  # Initialize internal states.
+    mm.get_key()  # Khởi tạo trạng thái hóa biểu nội bộ.
     mm.align_symbols()
     return mm
 
 
 def get_voices() -> List[Voice]:
-    # Fetch parameters
+    """Chuyển `NoteGroup` thành danh sách `Voice` sẵn sàng để dựng nhịp.
+
+    Nếu cụm có hai hướng thân nốt, tách thành hai voice độc lập.
+    """
+    # Lấy dữ liệu đầu vào từ các layer trung gian.
     groups = layers.get_layer('note_groups')
     notes = layers.get_layer('notes')
 
@@ -783,6 +872,7 @@ def get_voices() -> List[Voice]:
 
 
 def get_duration(sym: Union[Voice, Rest]) -> int:
+    """Lấy trường độ đã chuẩn hóa (tính cả chấm dôi nếu có)."""
     if isinstance(sym, Voice):
         return sym.duration
 
@@ -794,12 +884,17 @@ def get_duration(sym: Union[Voice, Rest]) -> int:
 
 
 def sort_symbols(voices: List[Voice]) -> Dict[int, List[Any]]:
+    """Gộp và sắp ký hiệu theo `group` rồi theo trục `x_center`.
+
+    Dấu hóa ngẫu nhiên (accidental gắn trực tiếp với nốt) bị loại khỏi danh sách
+    measure-level để không nhầm với hóa biểu đầu khuông.
+    """
     barlines = layers.get_layer('barlines')
     rests = layers.get_layer('rests')
     clefs = layers.get_layer('clefs')
     sfns = layers.get_layer('sfns')
 
-    # Assign symbols to the coressponding group
+    # Gán ký hiệu vào đúng nhóm khuông/hệ tương ứng.
     group_container: Any = {}
     def sort_group(insts: Union[List[Voice], List[Sfn], ndarray]) -> None:
         for inst in insts:
@@ -811,21 +906,26 @@ def sort_symbols(voices: List[Voice]) -> Dict[int, List[Any]]:
     sort_group(barlines)
     sort_group(rests)
     sort_group(clefs)
-    sort_group([sfn for sfn in sfns if sfn.note_id is None])  # Exclude accidental
+    sort_group([sfn for sfn in sfns if sfn.note_id is None])  # Loại accidental.
 
-    # Sort by their x-center
+    # Sắp xếp theo vị trí ngang để giữ thứ tự thời gian.
     for k in group_container:
         ll = group_container[k]
         ll = sorted(ll, key=lambda s: s.x_center)
         group_container[k] = ll
 
-    # Sort by group
+    # Sắp xếp theo chỉ số group tăng dần.
     temp_g = sorted(group_container.items(), key=lambda ele: ele[0])
     group_container = {ele[0]: ele[1] for ele in temp_g}
     return group_container
 
 
 def get_label_by_dura(duration, mapping):
+    """Suy ra nhãn gần nhất theo trường độ mục tiêu.
+
+    Chọn nhãn có duration không vượt quá mục tiêu và sai khác nhỏ nhất.
+    Nếu còn dư, đánh dấu `has_dot=True` như một cơ chế xấp xỉ thực dụng.
+    """
     duration = int(duration)
     min_diff = 9999999
     tar_label = None
@@ -838,12 +938,13 @@ def get_label_by_dura(duration, mapping):
     has_dot = False
     if min_diff > 0:
         dura = mapping[tar_label]
-        #assert dura // 2 == min_diff, f"{min_diff}, {duration}"
+        # assert dura // 2 == min_diff, f"{min_diff}, {duration}"
         has_dot = True
     return tar_label, has_dot
 
 
 def get_rest(duration):
+    """Tạo đối tượng `Rest` phù hợp với trường độ cần bù."""
     rest = Rest()
     tar_label, has_dot = get_label_by_dura(duration, REST_TYPE_TO_DURATION)
     rest.label = tar_label
@@ -852,12 +953,14 @@ def get_rest(duration):
 
 
 def get_chroma_pitch(pos: int, clef_type: ClefType) -> str:
+    """Ánh xạ vị trí dòng/khe sang tên cao độ chữ cái (A..G)."""
     order = G_CLEF_POS_TO_PITCH if clef_type == ClefType.G_CLEF else F_CLEF_POS_TO_PITCH
     pos = int(pos)
     return order[pos%7] if pos >= 0 else order[pos%-7]
 
 
 def extend_symbol_length(symbol, duration):
+    """Kéo dài trường độ của `Voice` hoặc `Rest` theo duration mục tiêu."""
     notes = layers.get_layer('notes')
     if isinstance(symbol, Voice):
         mapping = {k: v['duration'] for k, v in NOTE_TYPE_TO_RHYTHM.items()}
@@ -876,8 +979,9 @@ def extend_symbol_length(symbol, duration):
 
 
 def gen_measures(group_container):
+    """Hàm cũ để tách measure; giữ lại cho tương thích ngược."""
     measures = {}
-    num = 1  # Measure count starts from 1 for MusicXML
+    num = 1  # MusicXML đánh số measure từ 1.
     for grp, insts in group_container.items():
         measures[grp] = []
         buffer = []
@@ -886,14 +990,14 @@ def gen_measures(group_container):
         for inst in insts:
             if isinstance(inst, Barline):
                 if len(buffer) == 0:
-                    # Double barline
+                    # Hai vạch nhịp liền nhau.
                     double_barline = True
                 else:
                     mm = Measure()
                     mm.add_symbols(buffer)
                     mm.double_barline = double_barline
                     mm.number = num
-                    mm.get_key()  # Initialize internal states.
+                    mm.get_key()  # Khởi tạo trạng thái hóa biểu nội bộ.
                     mm.at_beginning = at_beginning
                     mm.group = grp
                     measures[grp].append(mm)
@@ -908,17 +1012,18 @@ def gen_measures(group_container):
 
 
 def decode_note(note, clef_type, is_chord=False, voice=1) -> Element:
+    """Giải mã một nốt sang cấu trúc XML `<note>` chuẩn MusicXML."""
     if note.invalid:
         return None  # type: ignore
 
-    # Element order matters!!
+    # Thứ tự phần tử rất quan trọng theo chuẩn MusicXML.
     elem = Element('note')
 
-    # Chord
+    # Đánh dấu nốt hợp âm (cùng thời điểm với nốt trước đó).
     if is_chord:
         elem.append(Element('chord'))
 
-    # Pitch
+    # Phần cao độ: step/alter/octave.
     pitch = SubElement(elem, 'pitch')
     step = SubElement(pitch, 'step')
     alter = SubElement(pitch, 'alter')
@@ -944,31 +1049,31 @@ def decode_note(note, clef_type, is_chord=False, voice=1) -> Element:
         elif note.sfn == SfnType.FLAT:
             alter.text = '-1'
 
-    # Check the pitch is within A0~C8
+    # Kiểm tra nằm trong dải cao độ piano A0..C8.
     if (int(octave.text) < 0 or int(octave.text) > 8) \
             or (int(octave.text) == 0 and step.text != "A") \
             or (int(octave.text) == 8 and step.text != "C"):
         return None  # type: ignore
 
-    # Rhythm type
+    # Trường độ cơ sở và nhãn nhịp.
     dura = SubElement(elem, 'duration')
     dura.text = str(NOTE_TYPE_TO_RHYTHM[note.label]['duration'])
     rhy = SubElement(elem, 'type')
     rhy.text = NOTE_TYPE_TO_RHYTHM[note.label]['name']  # type: ignore
 
-    # Dot
+    # Chấm dôi: nhân trường độ lên 1.5.
     if note.has_dot:
         du = int(dura.text)
         dura.text = str(round(du*1.5))
         elem.append(Element('dot'))
 
-    # Stem direction
+    # Hướng thân nốt.
     stem = SubElement(elem, 'stem')
     stem.text = "up" if note.stem_up else "down"
 
-    # Track
+    # Track/staff và voice trong MusicXML.
     track = SubElement(elem, 'staff')
-    track.text = str(note.track + 1)  # Start from one for MusicXML
+    track.text = str(note.track + 1)  # MusicXML đánh số staff từ 1.
     voi = SubElement(elem, "voice")
     voi.text = str(voice)
 
@@ -976,6 +1081,7 @@ def decode_note(note, clef_type, is_chord=False, voice=1) -> Element:
 
 
 def decode_rest(rest) -> Element:
+    """Giải mã dấu lặng sang XML `<note><rest .../>` theo MusicXML."""
     elem = Element('note')
     SubElement(elem, 'rest', attrib={'measure': 'yes'})
     dura = SubElement(elem, 'duration')
@@ -990,6 +1096,7 @@ def decode_rest(rest) -> Element:
 
 
 def decode_backup(dura):
+    """Tạo nút `<backup>` để lùi con trỏ thời gian trong measure."""
     if dura == 0:
         return None
     backup = Element('backup')
@@ -999,6 +1106,7 @@ def decode_backup(dura):
 
 
 def decode_forward(dura):
+    """Tạo nút `<forward>` để tiến con trỏ thời gian trong measure."""
     if dura == 0:
         return None
     forward = Element('forward')
@@ -1008,11 +1116,15 @@ def decode_forward(dura):
 
 
 def decode_clef(clef) -> Element:
+    """Giải mã khóa nhạc sang phần tử `attributes/clef`.
+
+    Có kèm heuristic bảo vệ: nếu nhận dạng F-clef ở track trên nhưng phổ vị trí
+    nốt cho thấy miền cao độ kiểu treble, đổi tạm sang G-clef để giảm lệch quãng.
+    """
     elem = Element('attributes')
     cc = SubElement(elem, 'clef', attrib={'number': str(clef.track+1)})
     sign = SubElement(cc, 'sign')
-    # Heuristic safeguard: if clef detected as F on upper track but notes on that
-    # track have positions indicating treble range, prefer G to avoid octave drop.
+    # Heuristic bảo vệ cho trường hợp nhầm khóa F/G ở track trên.
     try:
         label_char = clef.label.name[0]
         if clef.label.name == 'F_CLEF' and clef.track == 0:
@@ -1022,7 +1134,7 @@ def decode_clef(clef) -> Element:
                 if pos_vals:
                     import numpy as _np
                     med = _np.median(_np.array(pos_vals))
-                    if med > 3:  # heuristic threshold: high median -> likely treble
+                    if med > 3:  # Ngưỡng heuristic: median cao -> có xu hướng treble.
                         label_char = 'G'
                         logger.warning('decode_clef heuristic: overriding F -> G for track %s (median pos=%.1f)', clef.track, med)
     except Exception:
@@ -1034,6 +1146,7 @@ def decode_clef(clef) -> Element:
 
 
 def decode_key(key) -> Element:
+    """Giải mã hóa biểu sang `attributes/key/fifths`."""
     elem = Element('attributes')
     kk = SubElement(elem, 'key')
     fifths = SubElement(kk, 'fifths')
@@ -1042,6 +1155,7 @@ def decode_key(key) -> Element:
 
 
 def decode_measure(measure, key=None, key_change=False):
+    """Tạo XML cơ bản cho measure; tùy chọn chèn lại attributes khi đổi key."""
     elem = Element('measure', attrib={'number': str(measure.number)})
 
     if key_change:
@@ -1064,10 +1178,12 @@ def decode_measure(measure, key=None, key_change=False):
 
 
 def pretty_xml(elem: Element) -> bytes:
+    """Pretty-print cây XML và trả về bytes UTF-8."""
     return minidom.parseString(ET.tostring(elem)).toprettyxml(indent='  ', encoding='UTF-8')
 
 
 def build_part_list() -> Element:
+    """Tạo phần khai báo nhạc cụ/midi cho part-list."""
     parts = Element('part-list')
     part = SubElement(parts, 'score-part', attrib={'id': 'P1'})
     p_name = SubElement(part, 'part-name')
@@ -1091,6 +1207,7 @@ def build_part_list() -> Element:
 
 
 def build_work(f_name: Optional[str] = None) -> Element:
+    """Tạo metadata phần `work` (tiêu đề bản nhạc)."""
     work = Element("work")
     title = SubElement(work, "work-title")
     title.text = f_name if f_name is not None else "End-to-end OMR"
@@ -1098,6 +1215,7 @@ def build_work(f_name: Optional[str] = None) -> Element:
 
 
 def build_identity() -> Element:
+    """Tạo metadata phần `identification` (nguồn/chủ thể chuyển soạn)."""
     iden = Element("identification")
     creator = SubElement(iden, "creator", attrib={"type": "composer"})
     creator.text = "Transcribed by Oemer"

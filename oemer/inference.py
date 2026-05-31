@@ -53,10 +53,10 @@ def resize_image(image: Image.Image):
 
 
 def load_model(model_path: str, use_tf: bool = False):
-    """Load model from disk and return (model_obj, metadata).
+    """Tải mô hình từ đĩa và trả về (đối_tượng_mô_hình, metadata, kiểu_mô_hình).
 
-    For TF: returns (tf_model, {'input_shape': ..., 'output_shape': ...}, 'tf')
-    For ONNX: returns (onnx_session, metadata, 'onnx')
+    - Với TensorFlow: trả về (tf_model, {'input_shape': ..., 'output_shape': ...}, 'tf')
+    - Với ONNX: trả về (onnx_session, metadata, 'onnx')
     """
     if use_tf:
         import tensorflow as tf
@@ -71,7 +71,7 @@ def load_model(model_path: str, use_tf: bool = False):
         metadata = {"input_shape": model.input_shape, "output_shape": model.output_shape}
         return model, metadata, "tf"
 
-    # ONNX path
+    # Nhánh ONNX
     import onnxruntime as rt
 
     onnx_path = os.path.join(model_path, "model.onnx")
@@ -81,7 +81,7 @@ def load_model(model_path: str, use_tf: bool = False):
     with open(meta_path, "rb") as fh:
         metadata = pickle.load(fh)
 
-    # Select providers conservatively; let the runtime pick when not available
+    # Chọn provider theo hướng an toàn; runtime tự lùi về provider khả dụng khi cần.
     if sys.platform == "darwin":
         providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
     else:
@@ -94,8 +94,11 @@ def load_model(model_path: str, use_tf: bool = False):
 
 
 def tile_image(image: ndarray, win_size: int, step_size: int = 128):
-    """Tile `image` into patches of `win_size` with stride `step_size`.
-    Returns list of patches and list of (x,y) coordinates (top-left) for each patch.
+    """Chia ảnh thành các ô nhỏ kích thước win_size với bước trượt step_size.
+
+    Trả về:
+    - Danh sách các ô ảnh.
+    - Danh sách tọa độ (x, y) góc trên trái tương ứng từng ô.
     """
     patches = []
     coords = []
@@ -110,8 +113,9 @@ def tile_image(image: ndarray, win_size: int, step_size: int = 128):
 
 
 def predict_patches(model_obj, metadata: dict, model_type: str, patches: list, batch_size: int = 16):
-    """Run predictions on list of patches and return a list of outputs in same order.
-    Output per patch is assumed to be an ndarray of shape (win, win, channels).
+    """Chạy dự đoán theo lô trên danh sách patch và trả kết quả đúng thứ tự đầu vào.
+
+    Mỗi đầu ra patch được giả định có dạng mảng (win, win, channels).
     """
     outputs = []
     n = len(patches)
@@ -120,26 +124,34 @@ def predict_patches(model_obj, metadata: dict, model_type: str, patches: list, b
         if model_type == "tf":
             out = model_obj.predict(batch)
         else:
-            # ONNX expects a dict input name -> array; metadata contains output_names
+            # ONNX yêu cầu đầu vào dạng dict tên_input -> mảng; metadata chứa output_names.
             out = model_obj.run(metadata["output_names"], {"input": batch})[0]
-        # ensure iterable of outputs
+        # Đảm bảo đầu ra luôn được duyệt theo từng patch.
         for o in out:
             outputs.append(o)
     return outputs
 
 
 def merge_patches(patch_outputs: list, coords: list, image_shape: tuple, win_size: int, method: str = "count"):
-    """Merge predicted patches back to full image shape.
+    """Ghép các patch dự đoán trở lại kích thước ảnh đầy đủ.
 
-    patch_outputs: list of arrays shape (win_size, win_size, channels)
-    coords: list of (x, y) top-left coordinates in same order as patch_outputs
-    image_shape: (h, w)
-    method: 'count' (original average) or 'gaussian' (weighted blending)
+    - patch_outputs: danh sách mảng dạng (win_size, win_size, channels)
+    - coords: danh sách tọa độ (x, y) góc trên trái cùng thứ tự với patch_outputs
+    - image_shape: (h, w)
+    - method: 'count' (trung bình đếm chồng) hoặc 'gaussian' (ghép có trọng số)
     """
     if method == "gaussian":
+        # Ghép patch theo trọng số Gauss:
+        # Áp dụng hàm trọng số 2D Gaussian W(x,y) tâm ở trung tâm patch (x_c,y_c)
+        # để khu vực giữa patch có độ tin cậy cao hơn biên. Công thức:
+        #
+        #   W(x,y) = exp( - ((x-x_c)^2 + (y-y_c)^2) / (2 * sigma^2) )
+        #
+        # Kết quả: nhân xác suất patch với W rồi chuẩn hoá theo tổng trọng số,
+        # tạo ma trận dự đoán ghép mượt, giảm seam/artifact tại biên.
         return gaussian_weighted_merge(patch_outputs, coords, image_shape, win_size)
 
-    # fallback: original count-based merge
+    # Phương án dự phòng: ghép trung bình theo số lần chồng lấp (cách gốc).
     h, w = image_shape[:2]
     channels = patch_outputs[0].shape[-1]
     out = np.zeros((h, w, channels), dtype=np.float32)
@@ -147,7 +159,7 @@ def merge_patches(patch_outputs: list, coords: list, image_shape: tuple, win_siz
     for patch, (x, y) in zip(patch_outputs, coords):
         out[y : y + win_size, x : x + win_size] += patch
         mask[y : y + win_size, x : x + win_size] += 1
-    # Avoid division by zero
+    # Tránh chia cho 0.
     mask[mask == 0] = 1
     out = out / mask
     return out
@@ -165,12 +177,12 @@ def inference(
     print_artifacts: bool = False,
     generate_artifacts: bool = False,
 ) -> Tuple[ndarray, ndarray]:
-    # Load model
+    # Tải mô hình
     t0 = time.perf_counter()
     model_obj, metadata, model_type = load_model(model_path, use_tf=use_tf)
     t_model = time.perf_counter() - t0
 
-    # Read and prepare image
+    # Đọc và chuẩn bị ảnh đầu vào
     image_pil = Image.open(img_path)
     if "GIF" != image_pil.format:
         image_cv = cv2.imread(img_path)
@@ -178,10 +190,10 @@ def inference(
     image_pil = image_pil.convert("RGB")
     image = np.array(resize_image(image_pil))
 
-    # Determine window size from metadata
+    # Xác định kích thước cửa sổ từ metadata.
     win_size = metadata["input_shape"][1]
 
-    # Prepare cache key and try load
+    # Tạo khóa cache và thử tải kết quả đã lưu.
     cache_key = hashlib.sha256(f"{model_path}|{img_path}|{step_size}|{batch_size}|{merge_method}".encode("utf-8")).hexdigest()
     cache_dir = os.path.join(os.path.dirname(model_path), "..", "output", "cache")
     cache_dir = os.path.abspath(cache_dir)
@@ -190,7 +202,7 @@ def inference(
         if cached is not None:
             class_map, merged, meta = cached
             logger.debug("Loaded inference artifacts from cache: %s", cache_key)
-            # try to generate lightweight artifacts (report/heat) if requested
+            # Nếu được yêu cầu, tạo nhanh báo cáo/ảnh phụ trợ từ kết quả cache.
             try:
                 out_dir = os.path.dirname(img_path) or os.getcwd()
                 heat = entropy_heatmap(merged)
@@ -209,18 +221,23 @@ def inference(
     t_tile = time.perf_counter() - t_tile_start
     logger.debug("Tiled image into %d patches", len(patches))
 
-    # Predict
+    # Dự đoán
     t_pred_start = time.perf_counter()
     pred_patches = predict_patches(model_obj, metadata, model_type, patches, batch_size=batch_size)
     t_pred = time.perf_counter() - t_pred_start
 
-    # Merge
+    # Ghép kết quả patch
     t_merge_start = time.perf_counter()
     merged = merge_patches(pred_patches, coords, image.shape, win_size=win_size, method=merge_method)
     t_merge = time.perf_counter() - t_merge_start
 
-    # Convert probabilities to class map or threshold map
+    # Chuyển xác suất sang bản đồ lớp hoặc bản đồ ngưỡng.
     if manual_th is None:
+        # Chuyển ma trận xác suất thành nhãn nguyên cho mỗi pixel bằng argmax:
+        #
+        #   class_map(x,y) = argmax_c P_c(x,y)
+        #
+        # trong đó P_c(x,y) là xác suất dự đoán cho lớp c tại pixel (x,y).
         class_map = np.argmax(merged, axis=-1)
     else:
         assert len(manual_th) == merged.shape[-1] - 1, f"{manual_th}, {merged.shape[-1]}"
@@ -237,10 +254,10 @@ def inference(
         "total_s": round(total_time, 4),
     }
 
-    # Save cache for future runs
+    # Lưu cache cho các lần chạy sau.
     try:
         os.makedirs(cache_dir, exist_ok=True)
-        # compute model checksum if available
+        # Tính checksum mô hình nếu có file phù hợp.
         meta = {"model": model_path, "timings": timings}
         try:
             model_file = os.path.join(model_path, "model.onnx")
@@ -255,15 +272,21 @@ def inference(
     except Exception:
         pass
 
-    # Post-processing artifacts: entropy heatmap and report
+    # Hậu xử lý phụ trợ: bản đồ nhiệt entropy và báo cáo.
     try:
         out_dir = os.path.dirname(img_path) or os.getcwd()
+        # Tính entropy thông tin tại mỗi pixel từ ma trận xác suất:
+        #
+        #   H(x,y) = - sum_c P_c(x,y) * log2(P_c(x,y))
+        #
+        # Giá trị H lớn biểu thị dự đoán không chắc chắn; dùng để đánh dấu vùng
+        # độ tin cậy thấp cho hậu xử lý. Hàm trả về bản đồ nhiệt entropy.
         heat = entropy_heatmap(merged)
         heat_path = os.path.join(out_dir, f"{os.path.basename(img_path)}.entropy.png")
 
         low_conf_mask = confidence_filter(merged, threshold=0.6)
 
-        # derive boxes from low confidence mask; create overlay only if requested
+        # Suy ra bbox từ mặt nạ độ tin cậy thấp; chỉ tạo ảnh chồng khi được yêu cầu.
         boxes = low_conf_bboxes(low_conf_mask, min_area=64)
         overlay_path = None
         if generate_artifacts:
@@ -281,13 +304,13 @@ def inference(
             "low_conf_regions": len(boxes),
             "timings": timings,
         }
-        # emit report: either write files, print only, or do nothing
+        # Xuất báo cáo: ghi file, in ra màn hình, hoặc bỏ qua.
         if generate_artifacts:
             generate_report(img_path, class_map, merged, report, out_dir=out_dir, print_to_stdout=False)
         elif print_artifacts:
             generate_report(img_path, class_map, merged, report, out_dir=out_dir, print_to_stdout=True)
 
-        # detect note centers and perform advanced grouping + constraints
+        # Tìm tâm nốt và thử gom nhóm nâng cao + áp ràng buộc nhạc lý.
         try:
             centers = nge.extract_note_centers_from_classmap(class_map, class_value=2)
             unit = round(np.mean([get_unit_size(x, y) for x, y in centers])) if centers else 10
@@ -300,7 +323,7 @@ def inference(
             groups = []
             constrained = []
 
-        # overlay group highlights: write group overlay only if requested
+        # Vẽ nổi bật các nhóm nốt; chỉ ghi ảnh khi được yêu cầu.
         try:
             if centers and generate_artifacts:
                 group_overlay = os.path.join(out_dir, f"{os.path.basename(img_path)}.groups.png")
@@ -317,7 +340,7 @@ def inference(
         except Exception:
             pass
 
-        # generate interactive GUI viewer: write files only if requested, otherwise optionally print
+        # Tạo giao diện xem tương tác: chỉ ghi file khi được yêu cầu, ngược lại có thể in thông tin.
         try:
             if generate_artifacts:
                 html_path = generate_gui(img_path, overlay_path, heat_path, boxes=boxes, out_dir=out_dir, print_to_stdout=False)
@@ -371,7 +394,7 @@ def predict(region: ndarray, model_name: str) -> str:
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
-    img_path = os.path.join(project_root, "docs/images/de/dan-ga-con.png")
+    img_path = os.path.join(project_root, "images/de/dan-ga-con.png")
 
     # Mô hình unet_big: lấy class_map với staff (1) và symbols (2)
     model_path = os.path.join(script_dir, "checkpoints/unet_big")
